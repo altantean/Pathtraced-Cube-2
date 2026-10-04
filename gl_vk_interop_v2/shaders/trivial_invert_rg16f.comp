@@ -1,0 +1,32 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, rg16f) uniform image2D sharedImage;
+
+void main()
+{
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(sharedImage);
+    bool _32 = coord.x >= size.x;
+    bool _42;
+    if (!_32)
+    {
+        _42 = coord.y >= size.y;
+    }
+    else
+    {
+        _42 = _32;
+    }
+    if (_42)
+    {
+        return;
+    }
+    vec4 color = imageLoad(sharedImage, coord);
+    vec4 _55 = color;
+    vec3 _57 = vec3(1.0) - _55.xyz;
+    color.x = _57.x;
+    color.y = _57.y;
+    color.z = _57.z;
+    imageStore(sharedImage, coord, color);
+}
+

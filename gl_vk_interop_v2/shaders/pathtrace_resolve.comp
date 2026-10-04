@@ -1,0 +1,318 @@
+#version 460
+// pathtrace_resolve.comp, Sauerbraten path tracing, pass 2 of 2 ("resolve")
+#extension GL_EXT_scalar_block_layout : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D uDepth;
+layout(set = 0, binding = 1) uniform sampler2D uNormal;
+
+layout(std140, set = 0, binding = 6) uniform Params {
+    mat4 invViewProj;
+    mat4 invView;
+    mat4 resolveInvViewProj;
+    uvec4 frameData;
+    vec4 sunDirectionRadius;
+    vec4 sunColorPad;
+    vec4 skyAmbientPad;
+    vec4 ambientFloorPad;
+    vec4 emissiveImportancePad;
+    mat4 viewProj;
+    mat4 prevViewProjJittered;
+    uvec4 skyFaceIndexLo;
+    uvec4 skyFaceIndexHi;
+    vec4 skyRotationPad;
+    vec4 pomParams;
+    vec4 glassParams;
+    vec4 causticParams;
+    vec4 causticParams2;
+    vec4 waterParams;
+    vec4 waterCamera;
+    vec4 waterParams2;
+} p;
+
+layout(set = 0, binding = 7, rgba32f) uniform image2D uOutput;
+layout(set = 0, binding = 8) uniform sampler2D uHistoryPrev;
+layout(set = 0, binding = 9, rgba32f) uniform image2D uHistoryNext;
+layout(set = 0, binding = 10) uniform sampler2D uMotion;
+layout(set = 0, binding = 11) uniform sampler2D uHistoryMetaPrev;
+layout(set = 0, binding = 12, rgba16f) uniform image2D uHistoryMetaNext;
+layout(set = 0, binding = 14, rgba32f) readonly uniform image2D uRawRadiance;
+layout(set = 0, binding = 18, rgba16f) readonly uniform image2D uPrimaryNormal;
+layout(set = 0, binding = 19, rg16f) readonly uniform image2D uLinearDepthIn;
+
+vec2 octEncode(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 result = n.z >= 0.0 ? n.xy : (vec2(1.0) - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return result * 0.5 + 0.5;  // [-1,1] -> [0,1] for texture storage
+}
+
+vec3 octDecode(vec2 f) {
+    f = f * 2.0 - 1.0;  // [0,1] -> [-1,1]
+    vec3 n = vec3(f.x, f.y, 1.0 - abs(f.x) - abs(f.y));
+    float t = max(-n.z, 0.0);
+    n.x += n.x >= 0.0 ? -t : t;
+    n.y += n.y >= 0.0 ? -t : t;
+    return normalize(n);
+}
+
+// a water surface's .r carries a +4 offset
+vec3 decodePrimaryNormal(vec4 s, out bool water) {
+    water = s.r > 2.0;
+    return octDecode(vec2(water ? s.r - 4.0 : s.r, s.g));
+}
+
+// standard Rec.709 luma weights
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// reconstructs the primary hit's world position + normal waterSurface / waterStep
+bool reconstructForResolve(ivec2 pixel, ivec2 size, float rawDepth, out vec3 worldPos, out vec3 normal, out vec2 dynamicPrevUv,
+                           out bool waterSurface, out vec2 waterStep) {
+    waterSurface = false; waterStep = vec2(0.0);
+    if (rawDepth >= 1.0) { dynamicPrevUv = vec2(1000.0, 1000.0); return false; }
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    vec4 clip = vec4(uv * 2.0 - 1.0, rawDepth * 2.0 - 1.0, 1.0);
+    vec4 worldH = p.resolveInvViewProj * clip;
+    worldPos = worldH.xyz / worldH.w;
+    vec4 primarySample = imageLoad(uPrimaryNormal, pixel);
+    normal = decodePrimaryNormal(primarySample, waterSurface);
+    dynamicPrevUv = waterSurface ? vec2(1000.0, 1000.0) : primarySample.ba;
+    if (waterSurface) waterStep = primarySample.ba;
+    return true;
+}
+
+vec3 sampleHistoryCatmullRom(vec2 uv, vec2 texSize) {
+    vec2 samplePos = uv * texSize;
+    vec2 texPos1 = floor(samplePos - 0.5) + 0.5;
+    vec2 f = samplePos - texPos1;
+    vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    vec2 w3 = f * f * (-0.5 + 0.5 * f);
+    vec2 w12 = w1 + w2;
+    vec2 offset12 = w2 / w12;
+    vec2 tp0 = (texPos1 - 1.0) / texSize;
+    vec2 tp3 = (texPos1 + 2.0) / texSize;
+    vec2 tp12 = (texPos1 + offset12) / texSize;
+    vec3 r = vec3(0.0);
+    r += texture(uHistoryPrev, vec2(tp12.x, tp0.y)).rgb  * (w12.x * w0.y);
+    r += texture(uHistoryPrev, vec2(tp0.x,  tp12.y)).rgb * (w0.x  * w12.y);
+    r += texture(uHistoryPrev, vec2(tp12.x, tp12.y)).rgb * (w12.x * w12.y);
+    r += texture(uHistoryPrev, vec2(tp3.x,  tp12.y)).rgb * (w3.x  * w12.y);
+    r += texture(uHistoryPrev, vec2(tp12.x, tp3.y)).rgb  * (w12.x * w3.y);
+    float wsum = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    return r / wsum;
+}
+
+vec3 finiteOrZero(vec3 v) { return (any(isnan(v)) || any(isinf(v))) ? vec3(0.0) : v; }
+
+void main() {
+    ivec2 size = imageSize(uOutput);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+
+    vec4 rawSample = imageLoad(uRawRadiance, pixel);
+    vec3 radiance = finiteOrZero(rawSample.rgb);
+    float rawDepth = rawSample.a;
+    bool isDynamicHit = rawDepth < 0.0;  // sign-encoded, see pathtrace_trace.comp's encodedDepth
+    if (isDynamicHit) rawDepth = -rawDepth;
+
+    vec3 worldPos, normal;
+    vec2 dynamicPrevUv;
+    bool waterHit;
+    vec2 waterStep;
+    bool hasGeometry = reconstructForResolve(pixel, size, rawDepth, worldPos, normal, dynamicPrevUv, waterHit, waterStep);
+    // dynamicPrevUv is a valid reprojection target only for a skinned instance with a previous frame
+    // available
+
+    if (!hasGeometry) {
+        imageStore(uOutput, pixel, vec4(radiance, 1.0));
+        imageStore(uHistoryNext, pixel, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(uHistoryMetaNext, pixel, vec4(0.5, 0.5, 0.0, 0.0));
+        return;
+    }
+
+    vec4 prevClipJittered = p.prevViewProjJittered * vec4(waterHit ? worldPos + vec3(waterStep, 0.0) : worldPos, 1.0);
+    vec2 prevUv = isDynamicHit ? dynamicPrevUv : (prevClipJittered.xy / prevClipJittered.w * 0.5 + 0.5);
+    if (isDynamicHit && dynamicPrevUv.x > 999.0) {
+        vec2 mv = texelFetch(uMotion, pixel, 0).xy;
+        if (all(lessThan(abs(mv), vec2(1.0)))) prevUv = (vec2(pixel) + 0.5) / vec2(size) + mv;
+    }
+    bool validPrevProjection = isDynamicHit || prevClipJittered.w > 1e-4;
+    bool prevUvInBounds = validPrevProjection &&
+        all(greaterThanEqual(prevUv, vec2(0.0))) && all(lessThanEqual(prevUv, vec2(1.0)));
+
+    vec3 neighMin = radiance;
+    vec3 neighMax = radiance;
+    bool anyValidNeighbor = true;
+    vec3 spatialSum = radiance;  // self-inclusive weighted sum, weight 1.0
+    float spatialLumaSum = luminance(radiance);
+    float spatialLumaSqSum = spatialLumaSum * spatialLumaSum;
+    float spatialWeight = 1.0;
+    float neighMaxLumOthers = 0.0;
+    // the depth range and the normals of this 3x3 (self included), see depthOk/normalOk below
+    float neighMinDepth = rawDepth, neighMaxDepth = rawDepth;
+    vec3 neighNormals[9];
+    int neighNormalCount = 1;
+    neighNormals[0] = normal;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) continue;
+            ivec2 tap = clamp(pixel + ivec2(dx, dy), ivec2(0), size - ivec2(1));
+            vec4 tapSample = imageLoad(uRawRadiance, tap);
+            tapSample.rgb = finiteOrZero(tapSample.rgb);
+            if (tapSample.a >= 1.0) continue;
+            neighMin = min(neighMin, tapSample.rgb);
+            neighMax = max(neighMax, tapSample.rgb);
+            neighMaxLumOthers = max(neighMaxLumOthers, luminance(tapSample.rgb));
+            anyValidNeighbor = true;
+            neighMinDepth = min(neighMinDepth, abs(tapSample.a));
+            neighMaxDepth = max(neighMaxDepth, abs(tapSample.a));
+
+            vec4 tapNormalSample = imageLoad(uPrimaryNormal, tap);
+            bool tapWater;
+            vec3 tapNormal = decodePrimaryNormal(tapNormalSample, tapWater);
+            neighNormals[neighNormalCount++] = tapNormal;
+            float depthSigma = max(0.0015, rawDepth * 0.02);
+            float depthDiff = abs(tapSample.a) - rawDepth;
+            float depthWeight = exp(-0.5 * (depthDiff * depthDiff) / (depthSigma * depthSigma));
+            float normalWeight = pow(max(dot(tapNormal, normal), 0.0), 32.0);
+            float w = depthWeight * normalWeight;
+            spatialSum += tapSample.rgb * w;
+            float tapLuma = luminance(tapSample.rgb);
+            spatialLumaSum += tapLuma * w;
+            spatialLumaSqSum += tapLuma * tapLuma * w;
+            spatialWeight += w;
+        }
+    }
+    vec3 spatialAverage = spatialSum / max(spatialWeight, 1e-4);
+    float spatialMeanLuma = spatialLumaSum / max(spatialWeight, 1e-4);
+    float spatialVarianceLuma = max(0.0, spatialLumaSqSum / max(spatialWeight, 1e-4) - spatialMeanLuma * spatialMeanLuma);
+
+    bool historyAccepted = false;
+    float historyVarianceLuma = 0.0;
+    vec3 clampedHistory = vec3(0.0);
+    float historyLumaMoment2 = 0.0;
+    float blendFactor = 0.0;
+    float newSampleCount = 1.0;
+    if (p.frameData.z != 0u && prevUvInBounds) {
+        float expectedPrevDepth = clamp((prevClipJittered.z / prevClipJittered.w) * 0.5 + 0.5, 0.0, 1.0);
+        float depthThreshold = max(0.0015, expectedPrevDepth * 0.006);
+        const float depthShift = expectedPrevDepth - rawDepth;
+
+        vec2 base = prevUv * vec2(size) - 0.5;
+        ivec2 i0 = ivec2(floor(base));
+        vec2 f = clamp(base - vec2(i0), 0.0, 1.0);
+        ivec2 sizeMinusOne = size - ivec2(1);
+        ivec2 taps[4] = ivec2[4](
+            clamp(i0 + ivec2(0, 0), ivec2(0), sizeMinusOne),
+            clamp(i0 + ivec2(1, 0), ivec2(0), sizeMinusOne),
+            clamp(i0 + ivec2(0, 1), ivec2(0), sizeMinusOne),
+            clamp(i0 + ivec2(1, 1), ivec2(0), sizeMinusOne));
+        float bilinear[4] = float[4](
+            (1.0 - f.x) * (1.0 - f.y), f.x * (1.0 - f.y),
+            (1.0 - f.x) * f.y,         f.x * f.y);
+
+        vec3 historyColorSum = vec3(0.0);
+        float historyCountSum = 0.0;
+        float historyMoment2Sum = 0.0;
+        float totalWeight = 0.0;
+        int validTaps = 0;
+        vec3 tapColorMin = vec3(1e30);
+        vec3 tapColorMax = vec3(-1e30);
+        for (int t = 0; t < 4; ++t) {
+            vec4 h = texelFetch(uHistoryPrev, taps[t], 0);
+            vec4 m = texelFetch(uHistoryMetaPrev, taps[t], 0);
+            // A dynamic hit has no previous-frame depth here, normal consistency alone
+            bool depthOk = isDynamicHit || abs(h.a - expectedPrevDepth) <= depthThreshold ||
+                (h.a >= neighMinDepth + depthShift - depthThreshold && h.a <= neighMaxDepth + depthShift + depthThreshold);
+            vec3 historyNormal = octDecode(m.rg);
+            bool normalOk = dot(historyNormal, normal) >= 0.94;
+            if (!isDynamicHit) for (int k = 1; k < neighNormalCount && !normalOk; ++k) normalOk = dot(historyNormal, neighNormals[k]) >= 0.94;
+            float w = (depthOk && normalOk) ? bilinear[t] : 0.0;
+            if (depthOk && normalOk) {
+                ++validTaps;
+                tapColorMin = min(tapColorMin, h.rgb);
+                tapColorMax = max(tapColorMax, h.rgb);
+            }
+            historyColorSum += h.rgb * w;
+            historyCountSum += m.b * w;
+            historyMoment2Sum += m.a * w;
+            totalWeight += w;
+        }
+
+        if (totalWeight > 1e-4 && !any(isnan(historyColorSum)) && !any(isinf(historyColorSum))) {
+            historyAccepted = true;
+            clampedHistory = historyColorSum / totalWeight;
+            if (validTaps == 4) {
+                clampedHistory = clamp(sampleHistoryCatmullRom(prevUv, vec2(size)), tapColorMin, tapColorMax);
+            }
+            float historySampleCount = historyCountSum / totalWeight;
+            historyLumaMoment2 = historyMoment2Sum / totalWeight;
+            float historyMeanLuma = luminance(clampedHistory);
+            historyVarianceLuma = max(0.0, historyLumaMoment2 - historyMeanLuma * historyMeanLuma);
+
+            // cumulative moving average (1/N), capped at maxHistorySamples (p.sunColorPad.w)
+            bool waterPixel = !isDynamicHit && (waterHit || dynamicPrevUv.x > 1999.0);  // water, or lava (2000 sentinel)
+            float maxHistory = waterPixel ? max(p.waterParams2.z, 1.0) : p.sunColorPad.w;
+            vec2 curUv = (vec2(pixel) + 0.5) / vec2(size);
+            float motionPixels = length((prevUv - curUv) * vec2(size));
+            float virtualDist = imageLoad(uLinearDepthIn, pixel).g;
+            if (virtualDist > 0.0 && !isDynamicHit) {
+                vec3 camPos = (p.invView * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+                vec3 virtualPoint = camPos + normalize(worldPos - camPos) * virtualDist;
+                vec4 prevClipV = p.prevViewProjJittered * vec4(virtualPoint, 1.0);
+                if (prevClipV.w > 1e-4) {
+                    vec2 prevUvV = prevClipV.xy / prevClipV.w * 0.5 + 0.5;
+                    float slidePixels = length((prevUvV - prevUv) * vec2(size));
+                    maxHistory = min(maxHistory, max(1.5 / max(slidePixels, 1e-3), 1.0));
+                } else {
+                    maxHistory = 1.0;
+                }
+            } else if (virtualDist > 0.0 && isDynamicHit) {
+                if (motionPixels > 0.05) maxHistory = min(maxHistory, max(2.0, 1.0 / motionPixels));
+            }
+            {
+                float meanLuma = max(luminance(clampedHistory), 1e-4);
+                float relNoise = clamp(sqrt(historyVarianceLuma) / meanLuma, 0.0, 1.0);
+                maxHistory = min(maxHistory, max(p.sunColorPad.w / (1.0 + motionPixels * relNoise), 2.0));
+            }
+            newSampleCount = min(historySampleCount + 1.0, maxHistory);
+            float motionAlpha = mix(0.0, 0.7, smoothstep(1.0, 18.0, motionPixels));
+            float alpha = max(1.0 / newSampleCount, motionAlpha);
+            blendFactor = 1.0 - alpha;
+        }
+    }
+
+    {
+        float lum = luminance(radiance);
+        float cap = neighMaxLumOthers;
+        if (historyAccepted) {
+            float historyMeanLuma = luminance(clampedHistory);
+            cap = max(cap, historyMeanLuma + 3.0 * sqrt(historyVarianceLuma));
+        }
+        if (anyValidNeighbor && lum > cap && lum > 1e-6) {
+            radiance *= cap / lum;
+        }
+    }
+    vec3 temporalColor = radiance;
+    float newLumaMoment2 = luminance(radiance) * luminance(radiance);
+    if (historyAccepted) {
+        temporalColor = mix(radiance, clampedHistory, blendFactor);
+        newLumaMoment2 = mix(newLumaMoment2, historyLumaMoment2, blendFactor);
+    }
+
+    // variance-guided spatial filter
+    float varianceForSpatial = historyAccepted ? historyVarianceLuma : spatialVarianceLuma;
+    const float SPATIAL_VARIANCE_SCALE = 1.0;
+    const float MAX_SPATIAL_FACTOR = 0.0;
+    float spatialFactor = clamp(sqrt(varianceForSpatial) * SPATIAL_VARIANCE_SCALE, 0.0, MAX_SPATIAL_FACTOR);
+    vec3 displayColor = mix(temporalColor, spatialAverage, spatialFactor);
+
+    vec2 curNormalOct = octEncode(normal);
+    bool waterSurface = !isDynamicHit && hasGeometry && (waterHit || dynamicPrevUv.x > 1999.0);
+    float displayDepth = (isDynamicHit || waterSurface) ? -rawDepth : rawDepth;
+    imageStore(uOutput, pixel, vec4(displayColor, displayDepth));
+    imageStore(uHistoryNext, pixel, vec4(temporalColor, rawDepth));
+    imageStore(uHistoryMetaNext, pixel, vec4(curNormalOct, newSampleCount, newLumaMoment2));
+}

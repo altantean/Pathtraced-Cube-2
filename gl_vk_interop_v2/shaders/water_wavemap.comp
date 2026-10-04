@@ -1,0 +1,117 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_query : require
+// water_wavemap.comp path-traced water, depth + fetch aware waves
+#include "rt_water_rects.glsl"
+#include "rt_water_spectrum.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 3) uniform accelerationStructureEXT uTlas;
+layout(binding = 4, rgba16f) writeonly uniform image2D uWaveMapOut;
+layout(std140, binding = 5) uniform WaveMapParams {
+    vec4 map;
+    vec4 buckets;  // xy = bucket grid origin, z = bucket size, w = buckets along x
+    vec4 buckets2;
+    vec4 wind;  // xy = wind direction, z = wind speed, w = open-sea fetch
+    vec4 bands;  // x = cascade 1 starts, y = cascade 2 starts, z = shortest wave, w = g
+    vec4 sizes;
+} P;
+
+float traceWorld(vec3 o, vec3 d, float tmax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsNoOpaqueEXT, 0xFFu, o, 0.0, d, tmax);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+        int id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+        if (id == int(P.buckets2.y) || id >= int(P.buckets2.z)) continue;
+        rayQueryConfirmIntersectionEXT(rq);
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return tmax;
+    return rayQueryGetIntersectionTEXT(rq, true);
+}
+
+const float LAVA_SHORE_MAX = 96.0;
+float traceWorldExcept(vec3 o, vec3 d, float tmax, int skip) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsNoOpaqueEXT, 0xFFu, o, 0.0, d, tmax);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+        int id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+        if (id == int(P.buckets2.y) || id == skip || id >= int(P.buckets2.z)) continue;
+        rayQueryConfirmIntersectionEXT(rq);
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return tmax;
+    return rayQueryGetIntersectionTEXT(rq, true);
+}
+
+float traceOnly(vec3 o, vec3 d, float tmax, int only) {
+    if (only < 0) return tmax;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsNoOpaqueEXT, 0xFFu, o, 0.0, d, tmax);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+        if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false) == only) rayQueryConfirmIntersectionEXT(rq);
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return tmax;
+    return rayQueryGetIntersectionTEXT(rq, true);
+}
+
+// band energy, log-spaced samples (k dlnk measure)
+float bandEnergy(float lo, float hi, float g, float U, float F, float depth) {
+    float e = 0.0;
+    for (int i = 0; i < 8; ++i) {
+        float k = lo * pow(hi / lo, (float(i) + 0.5) / 8.0);
+        e += jonswapK(k, g, U, F) * k * (depth > 0.0 ? tmaFactor(k, g, depth) : 1.0);
+    }
+    return e;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(uWaveMapOut);
+    if (px.x >= size.x || px.y >= size.y) return;
+    vec2 xy = P.map.xy + (vec2(px) + 0.5) * P.map.z;
+    float z, kind, glow; uint mat;
+    if (!waterAt(xy, P.buckets, P.buckets2.x, z, mat, kind, glow)) {
+        imageStore(uWaveMapOut, px, vec4(0.0));
+        return;
+    }
+    if (kind > 0.5) {
+        float shore = LAVA_SHORE_MAX, fall = LAVA_SHORE_MAX;
+        for (int i = 0; i < 8; ++i) {
+            float a = 0.78539816 * float(i);
+            vec3 d = vec3(cos(a), sin(a), 0.0);
+            shore = min(shore, traceWorldExcept(vec3(xy, z + 1.0), d, LAVA_SHORE_MAX, int(P.buckets2.w)));
+            fall = min(fall, traceOnly(vec3(xy, z + 1.0), d, LAVA_SHORE_MAX, int(P.buckets2.w)));
+        }
+        // x = -coverage, y / z = coverage * distance to the bank / to a lavafall
+        imageStore(uWaveMapOut, px, vec4(-1.0, shore, fall, 0.0));
+        return;
+    }
+    float depth = traceWorld(vec3(xy, z - 0.05), vec3(0.0, 0.0, -1.0), 1e5);
+    float Fopen = P.wind.w;
+    float fetch = 0.0;
+    for (int i = -2; i <= 2; ++i) {
+        float a = radians(20.0 * float(i));
+        vec2 up = -P.wind.xy;
+        vec2 d = vec2(up.x * cos(a) - up.y * sin(a), up.x * sin(a) + up.y * cos(a));
+        float t = traceWorld(vec3(xy, z + 1.0), vec3(d, 0.0), Fopen);
+        // stopped at the world's edge
+        vec2 hit = xy + d * t;
+        const float EDGE = 32.0;
+        if (P.sizes.y > 0.0 && t < Fopen && (min(hit.x, hit.y) < EDGE || max(hit.x, hit.y) > P.sizes.y - EDGE)) t = Fopen;
+        fetch += t;
+    }
+    fetch = max(fetch / 5.0, 1.0);
+    float g = P.bands.w, U = P.wind.z;
+    float kmin = 6.2831853 / P.sizes.x;
+    float b[4] = float[4](kmin, P.bands.x, P.bands.y, P.bands.z);
+    vec3 w;
+    for (int c = 0; c < 3; ++c) {
+        float open = bandEnergy(b[c], b[c + 1], g, U, Fopen, -1.0);
+        float here = bandEnergy(b[c], b[c + 1], g, U, fetch, depth);
+        w[c] = open > 0.0 ? clamp(sqrt(here / open), 0.0, 1.5) : 0.0;
+    }
+    imageStore(uWaveMapOut, px, vec4(w, min(depth, 60000.0)));
+}

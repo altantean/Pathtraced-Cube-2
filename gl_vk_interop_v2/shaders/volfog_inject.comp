@@ -1,0 +1,562 @@
+#version 460
+// volfog_inject.comp, Volumetric fog, pass 1 of 2 ("inject")
+#extension GL_EXT_ray_query : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT uTlas;
+
+layout(std140, set = 0, binding = 1) uniform VolFogParams {
+    mat4 invViewProj;
+    mat4 prevViewProj;
+    uvec4 frameData;
+    vec4 sunDirectionRadius;
+    vec4 sunColorPad;  // rgb, [3] reserved
+    vec4 skyAmbientPad;  // rgb, [3] reserved
+    uvec4 gridDims;  // x=froxelCountX, y=froxelCountY, z=froxelCountZ, w=reserved
+    vec4 nearFarParams;
+    vec4 fogDensityParams;
+    vec4 phaseAndNoise;
+    vec4 camWorldPosPad;
+    vec4 camForwardPad;  // w = sampled picks over the remaining lights (volfoglightsamples)
+    vec4 mediumOverride;
+    vec4 localLightParams;
+    vec4 ambientFloor;  // rgb = the map's ambient floor (x2 overbright)
+    vec4 lava0;  // rt_lava.glsl's field params (= the path tracer's p.lava0 / p.lava1)
+    vec4 lava1;
+    vec4 lavaFog;
+    vec4 emissiveFog;
+    vec4 lavaTint;
+} p;
+
+layout(std430, set = 0, binding = 16) readonly buffer ColumnDepthBuf { float colDepth[]; };
+
+layout(set = 0, binding = 2) uniform sampler3D uFroxelVisibilityPrev;
+layout(set = 0, binding = 3, r16f) writeonly uniform image3D uFroxelVisibilityNext;
+layout(set = 0, binding = 4, rgba16f) writeonly uniform image3D uFroxelScatterExtinction;
+layout(set = 0, binding = 6) uniform sampler3D uFogNoise;
+layout(set = 0, binding = 7) uniform sampler3D uFroxelScatterExtinctionPrev;
+// particle light (gridDims.w = 1)
+layout(set = 0, binding = 11, rgba16f) writeonly uniform image3D uPartLightNext;
+layout(set = 0, binding = 12) uniform sampler3D uPartLightPrev;
+
+// same records as pathtrace_trace.comp's PathTraceLight / EmissiveTriangle
+struct FogLight {
+    vec4 posRadius;  // xyz = world position, w = falloff radius
+    vec4 colorFlags;  // rgb = color, w = flag bits
+    vec4 reserved;
+};
+layout(std430, set = 0, binding = 8) readonly buffer FogLightBuf { FogLight fogLights[]; };
+#include "rt_lightshape.glsl"  // capsule / sphere lights
+struct FogEmissiveTri {
+    vec4 v0, v1;
+    vec4 v2;  // w = cumulative power CDF (importance selection)
+    vec4 radiance;  // unscaled, times the glow scale, like the path tracer
+};
+layout(std430, set = 0, binding = 9) readonly buffer FogEmissiveBuf { FogEmissiveTri fogEmissives[]; };
+
+#define LIGHTGRID_BINDING 10
+#include "rt_lightgrid.glsl"
+#include "rt_lava.glsl"
+// the path tracer's scene data
+#define RT_MATERIALS_BINDING 13
+#define RT_TEXTURES_BINDING 14
+#include "rt_common.glsl"
+// = pathtrace_trace.comp's MaterialInfo
+struct FogMaterialInfo { uint diffuseTexIndex; uint normalTexIndex; uint glowTexIndex; uint flags;
+                        vec4 colorscale; vec4 glowcolor; vec4 parallax; vec4 scroll; };
+layout(std430, set = 0, binding = 15) readonly buffer FogMaterialInfoBuf { FogMaterialInfo fogMatInfos[]; };
+const uint FOG_MATFLAG_GLOW = 4u;
+
+// opaque shadow query shared by the sun and local-light rays
+bool fogOccluded(vec3 origin, float tMin, vec3 dir, float tMax) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT,
+                          0x7Du, origin, tMin, dir, tMax);  // no view models (0x02), no particle sprites (0x80)
+    while (rayQueryProceedEXT(rq)) { }
+    return rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+// exponential froxel Z-slice distribution
+float froxelSliceViewZ(float slice, float zCount, float nearZ, float farZ) {
+    return nearZ * pow(farZ / nearZ, slice / zCount);
+}
+
+float viewZToFroxelSlice(float viewZ, float zCount, float nearZ, float farZ) {
+    return zCount * log(max(viewZ, nearZ) / nearZ) / log(farZ / nearZ);
+}
+
+// reconstructs a froxel cell's world-space position and the camera ray direction through its XY center
+vec3 froxelCellWorldPos(uvec3 cell, uvec3 dims, out vec3 outRayDir) {
+    vec2 ndc = (vec2(cell.xy) + 0.5) / vec2(dims.xy) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    vec4 clipFar = vec4(ndc, 1.0, 1.0);
+    vec4 worldFar4 = p.invViewProj * clipFar;
+    vec3 worldFar = worldFar4.xyz / worldFar4.w;
+    vec3 rayDir = normalize(worldFar - p.camWorldPosPad.xyz);
+    outRayDir = rayDir;
+    float dist = froxelSliceViewZ(float(cell.z) + 0.5, float(dims.z), p.nearFarParams.x, p.nearFarParams.y);
+    return p.camWorldPosPad.xyz + rayDir * dist;
+}
+
+// reprojects a world position into the previous frame's froxel UVW space
+bool reprojectToPrevFroxelUVW(vec3 worldPos, out vec3 uvw) {
+    vec4 prevClip = p.prevViewProj * vec4(worldPos, 1.0);
+    if (prevClip.w <= 1e-4) return false;
+    vec2 prevNdc = prevClip.xy / prevClip.w;
+    prevNdc.y = -prevNdc.y;
+    if (any(lessThan(prevNdc, vec2(-1.0))) || any(greaterThan(prevNdc, vec2(1.0)))) return false;
+    // distance from this frame's camera position, not the true previous-frame camera position
+    float dist = length(worldPos - p.camWorldPosPad.xyz);
+    float sliceUV = viewZToFroxelSlice(dist, float(p.gridDims.z), p.nearFarParams.x, p.nearFarParams.y) / float(p.gridDims.z);
+    if (sliceUV < 0.0 || sliceUV > 1.0) return false;
+    uvw = vec3(prevNdc * 0.5 + 0.5, sliceUV);
+    return true;
+}
+
+// plain, well-known integer hash (Wang/xorshift-style)
+uint hash3(uvec3 v) {
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    v ^= v >> 16u;
+    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
+    return v.x ^ v.y ^ v.z;
+}
+
+// sun shadow-ray visibility for this froxel cell
+float sunVisibility(uvec3 cell, vec3 worldPos, bool forceRefresh, float blend) {
+    uint refreshFreq = max(p.frameData.y, 1u);
+    // uses the hash's high bits (>>24) for the modulo selection, not the raw low bits
+    bool refreshThisFrame = forceRefresh || ((p.frameData.x + (hash3(cell) >> 24u)) % refreshFreq) == 0u;
+
+    float historyVis = 1.0;
+    bool haveHistory = false;
+    if (p.frameData.z != 0u && p.nearFarParams.z > 0.5) {  // historyValid
+        vec3 prevUvw;
+        if (reprojectToPrevFroxelUVW(worldPos, prevUvw)) {
+            historyVis = texture(uFroxelVisibilityPrev, prevUvw).r;
+            haveHistory = historyVis >= 0.0;
+        }
+    }
+
+    if (!refreshThisFrame && haveHistory) return historyVis;
+
+    // fresh ray
+    vec3 toSun = normalize(-p.sunDirectionRadius.xyz);
+    uint seed = hash3(cell + uvec3(p.frameData.x * 2654435761u, p.frameData.x, 0u));
+    float r1 = float(seed & 0xFFFFu) / 65535.0;
+    float r2 = float((seed >> 16u) & 0xFFFFu) / 65535.0;
+    float angle = r1 * p.sunDirectionRadius.w;
+    float phi = r2 * 6.28318530718;
+    vec3 up = (abs(toSun.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(toSun, up));
+    vec3 bitangent = cross(toSun, tangent);
+    vec3 jitteredDir = normalize(toSun + (tangent * cos(phi) + bitangent * sin(phi)) * sin(angle));
+
+    // opaque-only, terminate-on-first-hit
+    float freshVis = fogOccluded(worldPos, 0.05, jitteredDir, 4096.0) ? 0.0 : 1.0;
+
+    return haveHistory ? mix(historyVis, freshVis, blend) : freshVis;
+}
+
+// map lights, dynamic lights and glowing (emissive) surfaces scatter into the fog, not only the sun
+uint gFogRng;
+float fogRand() {
+    gFogRng = gFogRng * 747796405u + 2891336453u;
+    uint w = ((gFogRng >> ((gFogRng >> 28u) + 4u)) ^ gFogRng) * 277803737u;
+    w = (w >> 22u) ^ w;
+    return float(w) * (1.0 / 4294967296.0);
+}
+float fogLum(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+// opaque-only shadow ray from the froxel to a point (same flags/mask as sunVisibility())
+bool fogPointVisible(vec3 from, vec3 to) {
+    vec3 d = to - from;
+    float len = length(d);
+    if (len < 0.2) return true;
+    return !fogOccluded(from, 0.05, d / len, len - 0.15);
+}
+
+float henyeyGreenstein(float cosTheta, float g);
+
+// unshadowed in-scatter of light i at worldPos toward the camera
+vec3 fogLightContribution(uint i, vec3 worldPos, vec3 rayDir) {
+    // reach and direction from the segment's nearest point
+    vec3 toLight = lightNearestPoint(fogLights[i].posRadius.xyz, lightHalfAxis(fogLights[i].colorFlags, fogLights[i].reserved), worldPos) - worldPos;
+    float dist = length(toLight);
+    if (dist < 1e-3) return vec3(0.0);
+    float radius = fogLights[i].posRadius.w;
+    int flags = int(fogLights[i].colorFlags.w + 0.5);
+    bool noFalloff = (flags & 2) != 0;
+    if (!noFalloff && dist >= radius) return vec3(0.0);
+    float atten = noFalloff ? 1.0 : (1.0 - dist / radius);
+    vec3 facing = lightDiscFacing(fogLights[i].colorFlags, fogLights[i].reserved);  // a glowing disc's facing (path-traced emission)
+    if (dot(facing, facing) > 0.25) atten *= abs(dot(toLight / dist, facing));
+    float phase = henyeyGreenstein(dot(rayDir, toLight / dist), p.phaseAndNoise.x);
+    return fogLights[i].colorFlags.rgb * (2.0 * 3.14159265359) * atten * phase;
+}
+
+bool fogLightVisible(uint i, vec3 worldPos) {
+    // a point along a capsule's segment, inside its source sphere
+    float lightSize = lightSourceRadius(fogLights[i].posRadius, fogLights[i].colorFlags, fogLights[i].reserved);
+    vec3 halfAxis = lightHalfAxis(fogLights[i].colorFlags, fogLights[i].reserved);
+    vec3 rs = vec3(fogRand(), fogRand(), fogRand()) * 2.0 - 1.0;
+    vec3 target = fogLights[i].posRadius.xyz + halfAxis * (fogRand() * 2.0 - 1.0) + rs * lightSize;
+    vec3 toT = target - worldPos;
+    float lenT = length(toT);
+    float gap = lightShadowGap(fogLights[i].colorFlags, fogLights[i].reserved);
+    vec3 end = lenT > gap + 0.2 ? target - toT / lenT * gap : worldPos;
+    return fogPointVisible(worldPos, end);
+}
+
+// cellSize
+vec3 localLightInscatter(uvec3 cell, vec3 worldPos, vec3 rayDir, float cellSize) {
+    float scale = p.localLightParams.x;
+    if (scale <= 0.0) return vec3(0.0);
+    gFogRng = hash3(cell ^ uvec3(p.frameData.x * 9781u, p.frameData.x * 6271u + 17u, p.frameData.x * 26699u + 91u));
+    vec3 sum = vec3(0.0);
+
+    // point / dynamic lights light splitting (the path tracer's see pathtrace_trace.comp's
+    // directLighting)
+    uint n = p.frameData.w;
+    LightList lightList = lightListAt(worldPos, n);
+    uint listSize = lightListSize(lightList);
+    const uint K = min(uint(p.camWorldPosPad.w + 0.5), 4u);  // volfoglightexact
+    const uint S = clamp(uint(p.camForwardPad.w + 0.5), 1u, 4u);  // volfoglightsamples
+    uint topK[4] = uint[4](0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu);
+    float topW[4] = float[4](0.0, 0.0, 0.0, 0.0);
+    float total = 0.0;
+    uint positive = 0u;
+    for (uint k = 0u; k < listSize; ++k) {
+        uint i = lightListGet(lightList, k);
+        if (i >= n) continue;
+        float w = fogLum(fogLightContribution(i, worldPos, rayDir));
+        if (w <= 0.0) continue;
+        total += w;
+        ++positive;
+        if (K > 0u) {
+            uint minSlot = 0u;
+            for (uint j = 1u; j < K; ++j) if (topW[j] < topW[minSlot]) minSlot = j;
+            if (w > topW[minSlot]) { topW[minSlot] = w; topK[minSlot] = k; }
+        }
+    }
+    if (total > 0.0) {
+        float tailW = total;
+        uint ranked = 0u;
+        for (uint j = 0u; j < K; ++j) if (topK[j] != 0xFFFFFFFFu) { tailW -= topW[j]; ++ranked; }
+        const bool sampleTail = tailW > 0.0 && positive > ranked + S;
+        const float stride = tailW / float(S);
+        float nextPick = fogRand() * stride, acc = 0.0;
+        for (uint k = 0u; k < listSize; ++k) {
+            uint i = lightListGet(lightList, k);
+            if (i >= n) continue;
+            vec3 c = fogLightContribution(i, worldPos, rayDir);
+            float w = fogLum(c);
+            if (w <= 0.0) continue;
+            bool exact = !sampleTail;
+            for (uint j = 0u; j < K; ++j) if (topK[j] == k) exact = true;
+            if (exact) {
+                if (fogLightVisible(i, worldPos)) sum += c;
+                continue;
+            }
+            acc += w;
+            uint picks = 0u;
+            while (nextPick < acc && picks < S) { ++picks; nextPick += stride; }
+            if (picks > 0u && fogLightVisible(i, worldPos))
+                sum += c * (float(picks) * tailW / (float(S) * w));
+        }
+    }
+
+    // emissive (glow) triangles, one power-importance sample
+    uint ec = uint(p.localLightParams.w + 0.5);
+    float totalPower = p.localLightParams.z;
+    if (ec > 0u && totalPower > 0.0) {
+        float u = fogRand();
+        uint lo = 0u, hi = ec - 1u;
+        while (lo < hi) {
+            uint mid = (lo + hi) >> 1u;
+            if (fogEmissives[mid].v2.w < u) lo = mid + 1u; else hi = mid;
+        }
+        FogEmissiveTri t = fogEmissives[lo];
+        float lumU = fogLum(t.radiance.rgb);
+        vec3 e1 = t.v1.xyz - t.v0.xyz, e2 = t.v2.xyz - t.v0.xyz;
+        vec3 cr = cross(e1, e2);
+        float crl = length(cr);
+        if (lumU > 0.0 && crl > 1e-8) {
+            float su = sqrt(fogRand()), r2 = fogRand();
+            vec3 pt = t.v0.xyz + e1 * (su * (1.0 - r2)) + e2 * (su * r2);
+            vec3 toE = pt - worldPos;
+            float d2 = dot(toE, toE);
+            float d = sqrt(d2);
+            if (d > 1e-3) {
+                vec3 L = toE / d;
+                float cosL = abs(dot(cr / crl, L));
+                // pdf(point) = lumU / totalPower per unit area (area-weighted CDF, uniform point)
+                float dFloor = max(2.0, 0.5 * cellSize);
+                vec3 c = t.radiance.rgb * p.localLightParams.y * henyeyGreenstein(dot(rayDir, L), p.phaseAndNoise.x)
+                       * cosL * totalPower / (lumU * max(d2, dFloor * dFloor));
+                const bool procLava = t.radiance.w > 0.5;
+                if (procLava ? p.lavaFog.w > 0.5 : p.emissiveFog.x > 0.5) {
+                    // MIS-weighted against the direction sample below (no distance floor, MIS is what
+                    // tames the near-emitter spikes)
+                    vec3 Le = procLava ? lavaTint(lavaSurface(pt, cr / crl, p.lavaFog.z, p.lava0, p.lava1).emission, p.lavaTint.xy) * p.localLightParams.y
+                                       : t.radiance.rgb * p.localLightParams.y;
+                    float pl = lumU * d2 / (totalPower * max(cosL, 1e-4));  // solid-angle pdf of this strategy
+                    float pd = 1.0 / (4.0 * 3.14159265359);
+                    c = Le * henyeyGreenstein(dot(rayDir, L), p.phaseAndNoise.x) / (pl + pd);  // (Le*phase/pl) * pl/(pl+pd)
+                }
+                if (cosL > 1e-4 && fogPointVisible(worldPos, pt - L * 0.1)) sum += c;
+            }
+        }
+    }
+    // glow light in fog, second strategy
+    const bool lavaOn = p.lavaFog.w > 0.5 && p.lavaFog.x >= 0.0;
+    const bool glowOn = p.emissiveFog.x > 0.5;
+    if ((lavaOn || glowOn) && ec > 0u && totalPower > 0.0) {
+        float zr = 1.0 - 2.0 * fogRand(), phi = 6.2831853 * fogRand();
+        float sr = sqrt(max(1.0 - zr * zr, 0.0));
+        vec3 dir = vec3(sr * cos(phi), sr * sin(phi), zr);
+        int lavaIdx = lavaOn ? int(p.lavaFog.x + 0.5) : -2;
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsNoneEXT, 0xFFu, worldPos, 0.05, dir, 4096.0);
+        float tTop = -1.0;
+        while (rayQueryProceedEXT(rq)) {
+            if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+            if (rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false) == lavaIdx) {  // the flat lava's tops
+                tTop = rayQueryGetIntersectionTEXT(rq, false);
+                rayQueryConfirmIntersectionEXT(rq);
+                continue;
+            }
+            // alpha-tested cutouts block where they pass
+            if (glowOn) {
+                bool passed; MaterialEntry unused;
+                if (resolveAlphaTestCandidate(rq, passed, unused) && passed) rayQueryConfirmIntersectionEXT(rq);
+            }
+        }
+        if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) {
+            int inst = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+            float th = rayQueryGetIntersectionTEXT(rq, true);
+            vec3 hp = worldPos + dir * th;
+            vec3 Le = vec3(0.0);
+            float lumSel = 0.0, cosL = 0.0;
+            if (inst == lavaIdx) {
+                bool top = abs(th - tTop) < 1e-3;
+                vec3 n = top ? vec3(0.0, 0.0, dir.z < 0.0 ? 1.0 : -1.0) : normalize(vec3(-dir.xy, 0.0) + vec3(1e-5, 0.0, 0.0));
+                cosL = abs(dot(n, dir));
+                Le = lavaTint(lavaSurface(hp, n, p.lavaFog.z, p.lava0, p.lava1).emission, p.lavaTint.xy) * p.localLightParams.y;
+                lumSel = p.lavaFog.y;
+            } else if (glowOn && inst >= 0 && inst < materials.length()) {
+                MaterialEntry m = materials[inst];
+                if (m.vertexAddr != 0ul && m.indexAddr != 0ul) {
+                    uint primId = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, true));
+                    if (rayQueryGetIntersectionGeometryIndexEXT(rq, true) == 1) primId += uint(m.albedoPad.w) / 3u;
+                    VertexBuf vb = VertexBuf(m.vertexAddr);
+                    IndexBuf ib = IndexBuf(m.indexAddr);
+                    uint i0 = ib.i[primId * 3u], i1 = ib.i[primId * 3u + 1u], i2 = ib.i[primId * 3u + 2u];
+                    uint mi = vb.v[i0].materialIndex;
+                    if (mi < uint(fogMatInfos.length())) {
+                        FogMaterialInfo mat = fogMatInfos[mi];
+                        if ((mat.flags & FOG_MATFLAG_GLOW) != 0u && mat.glowTexIndex != 0u && mat.scroll.w > 0.0) {
+                            vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+                            vec2 uv = vb.v[i0].uv * (1.0 - bc.x - bc.y) + vb.v[i1].uv * bc.x + vb.v[i2].uv * bc.y;
+                            // a coarse mip
+                            vec3 texel = textureLod(uMapTextures[nonuniformEXT(mat.glowTexIndex)], uv, 3.0).rgb;
+                            Le = pow(texel, vec3(2.2)) * mat.glowcolor.rgb * p.localLightParams.y;
+                            vec3 cr2 = cross(vb.v[i1].pos - vb.v[i0].pos, vb.v[i2].pos - vb.v[i0].pos);
+                            float cl = length(cr2);
+                            cosL = cl > 1e-8 ? abs(dot(cr2 / cl, dir)) : 0.0;
+                            lumSel = mat.scroll.w;
+                        }
+                    }
+                }
+            }
+            if (cosL > 1e-4 && lumSel > 0.0) {
+                float pl = lumSel * th * th / (totalPower * cosL);
+                float pd = 1.0 / (4.0 * 3.14159265359);
+                sum += Le * henyeyGreenstein(dot(rayDir, dir), p.phaseAndNoise.x) / (pl + pd);  // (Le*phase/pd) * pd/(pl+pd)
+            }
+        }
+    }
+    return sum * scale;
+}
+
+float henyeyGreenstein(float cosTheta, float g) {
+    float g2 = g * g;
+    float denom = max(1.0 + g2 - 2.0 * g * cosTheta, 1e-4);
+    return (1.0 - g2) / (4.0 * 3.14159265359 * denom * sqrt(denom));
+}
+
+// cheap analytic 3D value noise (hash-based, trilinearly interpolated between unit-cell corners)
+float hashNoise3(vec3 p3) {
+    vec3 i = floor(p3);
+    return float(hash3(uvec3(ivec3(i) & 0x3FF))) / 4294967295.0;
+}
+float valueNoise3(vec3 pos) {
+    vec3 i = floor(pos);
+    vec3 f = fract(pos);
+    f = f * f * (3.0 - 2.0 * f);  // smoothstep interpolant, avoids axis-aligned interpolation artifacts
+    float c000 = hashNoise3(i + vec3(0,0,0));
+    float c100 = hashNoise3(i + vec3(1,0,0));
+    float c010 = hashNoise3(i + vec3(0,1,0));
+    float c110 = hashNoise3(i + vec3(1,1,0));
+    float c001 = hashNoise3(i + vec3(0,0,1));
+    float c101 = hashNoise3(i + vec3(1,0,1));
+    float c011 = hashNoise3(i + vec3(0,1,1));
+    float c111 = hashNoise3(i + vec3(1,1,1));
+    float x00 = mix(c000, c100, f.x), x10 = mix(c010, c110, f.x);
+    float x01 = mix(c001, c101, f.x), x11 = mix(c011, c111, f.x);
+    float y0 = mix(x00, x10, f.y), y1 = mix(x01, x11, f.y);
+    return mix(y0, y1, f.z);
+}
+float fbmNoise3(vec3 pos, float cellSizeInNoiseSpace) {
+    float fade0 = clamp(1.0 - cellSizeInNoiseSpace, 0.0, 1.0);
+    float fade1 = clamp(1.0 - cellSizeInNoiseSpace * 2.17, 0.0, 1.0);
+    float n = valueNoise3(pos) * 0.6667 * fade0;
+    n += valueNoise3(pos * 2.17) * 0.3333 * fade1;
+    float usedWeight = 0.6667 * fade0 + 0.3333 * fade1;
+    return usedWeight > 1e-3 ? n / usedWeight : 0.5;
+}
+
+float froxelSliceThickness(float z, float zCount, float nearZ, float farZ) {
+    float b0 = froxelSliceViewZ(z, zCount, nearZ, farZ);
+    float b1 = froxelSliceViewZ(z + 1.0, zCount, nearZ, farZ);
+    return max(b1 - b0, 1e-3);
+}
+
+// extinction (density) at a world position
+float heightFogExtinction(vec3 worldPos, float cellWorldSize) {
+    if (p.mediumOverride.w > 0.5) {
+        return p.fogDensityParams.x;
+    }
+    float heightAboveBase = worldPos.z - p.fogDensityParams.y;
+    float density = p.fogDensityParams.x * exp(-p.fogDensityParams.z * max(heightAboveBase, 0.0));
+    if (p.phaseAndNoise.z > 0.5) {
+        float noiseFreq = p.phaseAndNoise.y * 0.01;
+        float n = fbmNoise3(worldPos * noiseFreq, cellWorldSize * noiseFreq);
+        density *= mix(1.0, n * 2.0, p.phaseAndNoise.w);
+    }
+    return max(density, 0.0);
+}
+
+void main() {
+    uvec3 cell = gl_GlobalInvocationID;
+    uvec3 dims = p.gridDims.xyz;
+    if (any(greaterThanEqual(cell, dims))) return;
+
+    vec3 rayDir;
+    vec3 worldPos = froxelCellWorldPos(cell, dims, rayDir);
+
+    if (p.nearFarParams.w > 9.5) {
+        vec2 ndcFlip = (vec2(cell.xy) + 0.5) / vec2(dims.xy) * 2.0 - 1.0;
+        ndcFlip.y = -ndcFlip.y;
+        vec4 clipFarFlip = vec4(ndcFlip, 1.0, 1.0);
+        vec4 worldFarFlip4 = p.invViewProj * clipFarFlip;
+        vec3 worldFarFlip = worldFarFlip4.xyz / worldFarFlip4.w;
+        vec3 rayDirFlip = normalize(worldFarFlip - p.camWorldPosPad.xyz);
+        float distFlip = froxelSliceViewZ(float(cell.z) + 0.5, float(dims.z), p.nearFarParams.x, p.nearFarParams.y);
+        vec3 worldPosFlip = p.camWorldPosPad.xyz + rayDirFlip * distFlip;
+        vec3 posPatternFlip = fract(worldPosFlip * 0.0025);
+        imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(1.0, 0.0, 0.0, 0.0));
+        imageStore(uFroxelScatterExtinction, ivec3(cell), vec4(posPatternFlip, 1.0));
+        return;
+    }
+
+    // mode 9
+    if (p.nearFarParams.w > 8.5) {
+        vec3 rayDirColor = rayDir * 0.5 + 0.5;
+        imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(1.0, 0.0, 0.0, 0.0));
+        imageStore(uFroxelScatterExtinction, ivec3(cell), vec4(rayDirColor, 1.0));
+        return;
+    }
+
+    if (p.nearFarParams.w > 7.5) {
+        vec3 cellColor = vec3(0.0, 0.0, float(cell.z) / float(dims.z));
+        imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(1.0, 0.0, 0.0, 0.0));
+        imageStore(uFroxelScatterExtinction, ivec3(cell), vec4(cellColor, 1.0));
+        return;
+    }
+    if (p.nearFarParams.w > 6.5) {
+        // REVISED (this revision) --: still visibly shifts with camera movement even as a direct,
+        // unblended sample
+        vec3 cellColor = vec3(vec2(cell.xy) / vec2(dims.xy), 0.5);
+        imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(1.0, 0.0, 0.0, 0.0));
+        imageStore(uFroxelScatterExtinction, ivec3(cell), vec4(cellColor, 1.0));
+        return;
+    }
+    // mode 6
+    if (p.nearFarParams.w > 5.5) {
+        imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(1.0, 0.0, 0.0, 0.0));
+        imageStore(uFroxelScatterExtinction, ivec3(cell), vec4(0.9, 0.2, 0.9, 1.0));
+        return;
+    }
+    // mode 5
+    if (p.nearFarParams.w > 4.5) {
+        // REVISED (this revision) 0.1 (10-world-unit repeat) was too fine
+        vec3 posPattern = fract(worldPos * 0.0025);
+        imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(1.0, 0.0, 0.0, 0.0));
+        imageStore(uFroxelScatterExtinction, ivec3(cell), vec4(posPattern, 1.0));
+        return;
+    }
+
+    float cellWorldSize = froxelSliceThickness(float(cell.z), float(dims.z), p.nearFarParams.x, p.nearFarParams.y);
+    const bool partLight = p.gridDims.w != 0u;
+    vec3 baseColor = (p.mediumOverride.w > 0.5) ? p.mediumOverride.rgb : vec3(1.0);
+
+    if (p.emissiveFog.z > 0.5) {
+        float nearEdge = froxelSliceViewZ(float(cell.z), float(dims.z), p.nearFarParams.x, p.nearFarParams.y);
+        if (nearEdge > colDepth[cell.y * dims.x + cell.x] + max(cellWorldSize, 8.0)) {
+            float ext = heightFogExtinction(worldPos, cellWorldSize);
+            imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(-1000.0, 0.0, 0.0, 0.0));  // big so any filtered blend with it stays negative
+            imageStore(uFroxelScatterExtinction, ivec3(cell), vec4(baseColor * ext * p.skyAmbientPad.rgb * 0.25, ext));
+            if (partLight) imageStore(uPartLightNext, ivec3(cell), vec4(p.ambientFloor.rgb, 1.0));
+            return;
+        }
+    }
+
+    const uint relightN = max(uint(p.emissiveFog.w + 0.5), 1u);
+    const bool useHistory = p.frameData.z != 0u && p.nearFarParams.z > 0.5;
+    vec3 histUvw = vec3(0.0);
+    bool histOk = useHistory && reprojectToPrevFroxelUVW(worldPos, histUvw);
+    if (histOk && texture(uFroxelVisibilityPrev, histUvw).r < 0.0) histOk = false;  // was hidden
+    const bool relight = relightN <= 1u || !histOk ||
+        ((p.frameData.x + (hash3(cell ^ uvec3(0x9E37u, 0x79B9u, 0x7F4Au)) >> 24u)) % relightN) == 0u;
+    if (!relight) {
+        imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(texture(uFroxelVisibilityPrev, histUvw).r, 0.0, 0.0, 0.0));
+        imageStore(uFroxelScatterExtinction, ivec3(cell), texture(uFroxelScatterExtinctionPrev, histUvw));
+        if (partLight) imageStore(uPartLightNext, ivec3(cell), vec4(texture(uPartLightPrev, histUvw).rgb, 1.0));
+        return;
+    }
+    // a relit froxel stands in for N frames, so it takes a bigger share than the usual 0.25
+    const float blend = relightN > 1u ? 0.5 : 0.25;
+
+    float extinction = heightFogExtinction(worldPos, cellWorldSize);
+    float vis = sunVisibility(cell, worldPos, relightN > 1u, blend);
+    imageStore(uFroxelVisibilityNext, ivec3(cell), vec4(vis, 0.0, 0.0, 0.0));
+
+    float cosTheta = dot(rayDir, -normalize(p.sunDirectionRadius.xyz));
+    float phase = henyeyGreenstein(cosTheta, p.phaseAndNoise.x);
+    vec3 sunTerm = p.sunColorPad.rgb * vis * phase;
+    // ambient term
+    vec3 ambientTerm = p.skyAmbientPad.rgb * 0.25 * mix(p.fogDensityParams.w, 1.0, vis);
+    vec3 localTerm = (extinction > 0.0 || partLight) ? localLightInscatter(cell, worldPos, rayDir, cellWorldSize) : vec3(0.0);
+    vec3 inscatter = baseColor * extinction * (sunTerm + ambientTerm + localTerm);
+    if (partLight) {
+        const float FOUR_PI = 12.5663706144;
+        vec3 fresh = max((sunTerm + localTerm) * (FOUR_PI / 3.14159265359) + 2.0 * p.skyAmbientPad.rgb * mix(p.fogDensityParams.w, 1.0, vis),
+                         p.ambientFloor.rgb);
+        vec3 outLight = fresh;
+        if (histOk) outLight = mix(texture(uPartLightPrev, histUvw).rgb, fresh, blend);
+        imageStore(uPartLightNext, ivec3(cell), vec4(outLight, 1.0));
+    }
+
+    vec4 freshScatter = vec4(inscatter, extinction);
+    vec4 outScatter = freshScatter;
+    if (histOk) outScatter = mix(texture(uFroxelScatterExtinctionPrev, histUvw), freshScatter, blend);
+
+    imageStore(uFroxelScatterExtinction, ivec3(cell), outScatter);
+}

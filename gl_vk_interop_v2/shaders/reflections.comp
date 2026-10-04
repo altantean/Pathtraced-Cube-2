@@ -1,0 +1,326 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 8, std140) uniform Params
+{
+    mat4 invViewProj;
+    mat4 invView;
+    mat4 currentViewProjUnjittered;
+    mat4 prevViewProjJittered;
+    mat4 prevViewProjUnjittered;
+    vec4 settings;
+    uvec4 frameData;
+    vec4 extra;
+    vec4 skyHorizonColor;
+    vec4 skyZenithColor;
+    vec4 skyGroundColor;
+} p;
+
+layout(set = 0, binding = 7) uniform accelerationStructureEXT uTLAS;
+layout(set = 0, binding = 3) uniform sampler2D uPrevSceneColor;
+layout(set = 0, binding = 0) uniform sampler2D uDepth;
+layout(set = 0, binding = 1) uniform sampler2D uNormalRoughness;
+layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D uReflOutput;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D uReflHistoryNext;
+layout(set = 0, binding = 10, rgba16f) uniform writeonly image2D uReflGeoHistoryNext;
+layout(set = 0, binding = 5) uniform sampler2D uReflHistoryPrev;
+layout(set = 0, binding = 9) uniform sampler2D uReflGeoHistoryPrev;
+layout(set = 0, binding = 2) uniform sampler2D uMotion;
+
+rayQueryEXT q;
+
+vec2 octEncode(inout vec3 n)
+{
+    n /= vec3((abs(n.x) + abs(n.y)) + abs(n.z));
+    vec2 e = n.xy;
+    if (n.z < 0.0)
+    {
+        e = (vec2(1.0) - abs(e.yx)) * sign(e);
+    }
+    return (e * 0.5) + vec2(0.5);
+}
+
+vec3 reflectDir(vec3 V, vec3 N)
+{
+    return normalize(V - (N * (2.0 * dot(V, N))));
+}
+
+uint hash(inout uvec2 x)
+{
+    x *= uvec2(1664525u, 1013904223u);
+    x ^= (x.yx >> uvec2(ivec2(16)));
+    x *= uvec2(2246822519u, 3266489917u);
+    x ^= (x.yx >> uvec2(ivec2(13)));
+    return x.x ^ x.y;
+}
+
+vec2 rand2(uvec2 pix)
+{
+    uvec2 param = pix + uvec2(p.frameData.x * 1664525u);
+    uint _105 = hash(param);
+    uint h = _105;
+    return vec2(float(h & 65535u), float(h >> uint(16))) / vec2(65535.0);
+}
+
+vec3 jitterCone(vec3 centerDir, float coneAngle, vec2 r)
+{
+    if (coneAngle <= 9.9999997473787516355514526367188e-06)
+    {
+        return centerDir;
+    }
+    float ang = 6.283185482025146484375 * r.x;
+    float rad = coneAngle * sqrt(r.y);
+    vec3 tangent = mix(vec3(1.0, 0.0, 0.0), vec3(0.0, 0.0, 1.0), bvec3(abs(centerDir.z) < 0.999000012874603271484375));
+    vec3 t = normalize(cross(tangent, centerDir));
+    vec3 b = cross(centerDir, t);
+    return normalize((centerDir + (t * (cos(ang) * rad))) + (b * (sin(ang) * rad)));
+}
+
+vec3 sampleSkyFallback(vec3 dir)
+{
+    float aboveT = smoothstep(-0.0500000007450580596923828125, 0.3499999940395355224609375, dir.y);
+    vec3 upperSky = mix(p.skyHorizonColor.xyz, p.skyZenithColor.xyz, vec3(aboveT));
+    float belowT = 1.0 - smoothstep(-0.300000011920928955078125, 0.0500000007450580596923828125, dir.y);
+    return mix(upperSky, p.skyGroundColor.xyz, vec3(belowT));
+}
+
+bool traceReflectionRay(vec3 origin, vec3 dir, inout vec3 hitColor)
+{
+    rayQueryInitializeEXT(q, uTLAS, 1u, 255u, origin, 0.0, dir, p.settings.y);
+    for (;;)
+    {
+        bool _322 = rayQueryProceedEXT(q);
+        if (_322)
+        {
+            continue;
+        }
+        else
+        {
+            break;
+        }
+    }
+    uint _325 = rayQueryGetIntersectionTypeEXT(q, bool(1));
+    if (_325 == 0u)
+    {
+        vec3 param = dir;
+        hitColor = sampleSkyFallback(param);
+        return true;
+    }
+    float _334 = rayQueryGetIntersectionTEXT(q, bool(1));
+    float hitT = _334;
+    vec3 hitWorldPos = origin + (dir * hitT);
+    vec4 hitClipPrev = p.prevViewProjJittered * vec4(hitWorldPos, 1.0);
+    if (hitClipPrev.w <= 9.9999999747524270787835121154785e-07)
+    {
+        hitColor = vec3(0.0);
+        return false;
+    }
+    vec2 hitUvPrev = ((hitClipPrev.xy / vec2(hitClipPrev.w)) * 0.5) + vec2(0.5);
+    bool _377 = any(lessThan(hitUvPrev, vec2(0.0)));
+    bool _385;
+    if (!_377)
+    {
+        _385 = any(greaterThan(hitUvPrev, vec2(1.0)));
+    }
+    else
+    {
+        _385 = _377;
+    }
+    if (_385)
+    {
+        hitColor = vec3(0.0);
+        return false;
+    }
+    hitColor = textureLod(uPrevSceneColor, hitUvPrev, 0.0).xyz;
+    return true;
+}
+
+vec3 octDecode(vec2 e)
+{
+    vec2 f = (e * 2.0) - vec2(1.0);
+    vec3 n = vec3(f, (1.0 - abs(f.x)) - abs(f.y));
+    if (n.z < 0.0)
+    {
+        vec3 _194 = n;
+        vec3 _199 = n;
+        vec2 _202 = (vec2(1.0) - abs(_194.yx)) * sign(_199.xy);
+        n.x = _202.x;
+        n.y = _202.y;
+    }
+    return normalize(n);
+}
+
+void main()
+{
+    uvec2 pix = gl_GlobalInvocationID.xy;
+    bool _409 = pix.x >= p.frameData.y;
+    bool _418;
+    if (!_409)
+    {
+        _418 = pix.y >= p.frameData.z;
+    }
+    else
+    {
+        _418 = _409;
+    }
+    if (_418)
+    {
+        return;
+    }
+    ivec2 ipix = ivec2(pix);
+    vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(float(p.frameData.y), float(p.frameData.z));
+    float depth = texelFetch(uDepth, ipix, 0).x;
+    vec4 normalRoughness = texelFetch(uNormalRoughness, ipix, 0);
+    vec3 nView = normalRoughness.xyz;
+    float roughness = clamp(normalRoughness.w, 0.0, 1.0);
+    bool _462 = depth >= 0.999998986721038818359375;
+    bool _470;
+    if (!_462)
+    {
+        _470 = dot(nView, nView) < 9.9999999747524270787835121154785e-07;
+    }
+    else
+    {
+        _470 = _462;
+    }
+    if (_470)
+    {
+        imageStore(uReflOutput, ipix, vec4(0.0));
+        imageStore(uReflHistoryNext, ipix, vec4(0.0));
+        imageStore(uReflGeoHistoryNext, ipix, vec4(depth, 0.5, 0.5, 0.0));
+        return;
+    }
+    vec3 nWorld = normalize((p.invView * vec4(nView, 0.0)).xyz);
+    if (p.extra.x <= 0.5)
+    {
+        imageStore(uReflOutput, ipix, vec4(0.0));
+        imageStore(uReflHistoryNext, ipix, vec4(0.0));
+        vec3 param = nWorld;
+        vec2 _514 = octEncode(param);
+        imageStore(uReflGeoHistoryNext, ipix, vec4(depth, _514, 0.0));
+        return;
+    }
+    vec4 clip = vec4((uv * 2.0) - vec2(1.0), (depth * 2.0) - 1.0, 1.0);
+    vec4 worldH = p.invViewProj * clip;
+    vec3 worldPos = worldH.xyz / vec3(worldH.w);
+    vec3 cameraWorldPos = (p.invView * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    vec3 V = normalize(worldPos - cameraWorldPos);
+    vec3 param_1 = V;
+    vec3 param_2 = nWorld;
+    vec3 mirrorDir = reflectDir(param_1, param_2);
+    vec3 origin = worldPos + (nWorld * p.settings.x);
+    float coneAngle = roughness * p.settings.z;
+    uint rays = clamp(p.frameData.w, 1u, 16u);
+    vec3 colorSum = vec3(0.0);
+    float validSum = 0.0;
+    vec3 param_9;
+    for (uint rayIndex = 0u; rayIndex < rays; rayIndex++)
+    {
+        uvec2 param_3 = pix + uvec2(rayIndex * 2654435769u, rayIndex * 2246822507u);
+        vec2 r = rand2(param_3);
+        vec3 param_4 = mirrorDir;
+        float param_5 = coneAngle;
+        vec2 param_6 = r;
+        vec3 dir = jitterCone(param_4, param_5, param_6);
+        vec3 param_7 = origin;
+        vec3 param_8 = dir;
+        bool _615 = traceReflectionRay(param_7, param_8, param_9);
+        vec3 hitColor = param_9;
+        bool valid = _615;
+        colorSum += hitColor;
+        validSum += float(valid);
+    }
+    vec3 current = colorSum / vec3(float(rays));
+    float currentValidity = validSum / float(rays);
+    vec3 result = current;
+    float resultValidity = currentValidity;
+    bool _643 = p.settings.w > 0.5;
+    bool _649;
+    if (_643)
+    {
+        _649 = p.extra.x > 0.5;
+    }
+    else
+    {
+        _649 = _643;
+    }
+    if (_649)
+    {
+        vec4 prevClipJittered = p.prevViewProjJittered * worldH;
+        bool validPrevProjection = prevClipJittered.w > 9.9999999747524270787835121154785e-07;
+        vec2 expectedPrevUv = ((prevClipJittered.xy / vec2(prevClipJittered.w)) * 0.5) + vec2(0.5);
+        float expectedPrevDepth = ((prevClipJittered.z / prevClipJittered.w) * 0.5) + 0.5;
+        bool _685;
+        if (validPrevProjection)
+        {
+            _685 = all(greaterThanEqual(expectedPrevUv, vec2(0.0)));
+        }
+        else
+        {
+            _685 = validPrevProjection;
+        }
+        bool _691;
+        if (_685)
+        {
+            _691 = all(lessThanEqual(expectedPrevUv, vec2(1.0)));
+        }
+        else
+        {
+            _691 = _685;
+        }
+        if (_691)
+        {
+            ivec2 prevPix = ivec2(clamp(expectedPrevUv * vec2(float(p.frameData.y), float(p.frameData.z)), vec2(0.0), vec2(float(p.frameData.y - 1u), float(p.frameData.z - 1u))));
+            vec4 history = texelFetch(uReflHistoryPrev, prevPix, 0);
+            vec4 geoHistory = texelFetch(uReflGeoHistoryPrev, prevPix, 0);
+            float depthDelta = abs(geoHistory.x - expectedPrevDepth);
+            float depthThreshold = max(0.00150000001303851604461669921875, abs(expectedPrevDepth) * 0.006000000052154064178466796875);
+            vec2 param_10 = geoHistory.yz;
+            vec3 historyNormal = octDecode(param_10);
+            float normalAgreement = dot(historyNormal, nWorld);
+            bool depthValid = depthDelta <= depthThreshold;
+            bool normalValid = normalAgreement >= 0.939999997615814208984375;
+            if (depthValid && normalValid)
+            {
+                vec4 currentClipUnjittered = p.currentViewProjUnjittered * worldH;
+                vec4 prevClipUnjittered = p.prevViewProjUnjittered * worldH;
+                bool _777 = currentClipUnjittered.w > 9.9999999747524270787835121154785e-07;
+                bool _783;
+                if (_777)
+                {
+                    _783 = prevClipUnjittered.w > 9.9999999747524270787835121154785e-07;
+                }
+                else
+                {
+                    _783 = _777;
+                }
+                bool validMotionProjection = _783;
+                float motionConsistency = 1.0;
+                if (validMotionProjection)
+                {
+                    vec2 currentUnjUv = ((currentClipUnjittered.xy / vec2(currentClipUnjittered.w)) * 0.5) + vec2(0.5);
+                    vec2 prevUnjUv = ((prevClipUnjittered.xy / vec2(prevClipUnjittered.w)) * 0.5) + vec2(0.5);
+                    vec2 expectedMotion = prevUnjUv - currentUnjUv;
+                    vec2 motion = texelFetch(uMotion, ipix, 0).xy;
+                    float motionErrorPixels = length((motion - expectedMotion) * vec2(float(p.frameData.y), float(p.frameData.z)));
+                    motionConsistency = exp(((-0.5) * (motionErrorPixels * motionErrorPixels)) / 6.25);
+                }
+                float motionPixels = length((expectedPrevUv - uv) * vec2(float(p.frameData.y), float(p.frameData.z)));
+                float motionFade = smoothstep(1.0, 18.0, motionPixels);
+                float historyWeight = mix(0.87999999523162841796875, 0.300000011920928955078125, motionFade) * motionConsistency;
+                float clampedWeight = clamp(historyWeight, 0.0, 0.89999997615814208984375);
+                float effectiveWeight = clampedWeight * history.w;
+                result = mix(current, history.xyz, vec3(effectiveWeight));
+                resultValidity = mix(currentValidity, history.w, effectiveWeight);
+            }
+        }
+    }
+    imageStore(uReflOutput, ipix, vec4(result, resultValidity));
+    imageStore(uReflHistoryNext, ipix, vec4(result, resultValidity));
+    vec3 param_11 = nWorld;
+    vec2 _905 = octEncode(param_11);
+    imageStore(uReflGeoHistoryNext, ipix, vec4(depth, _905, 0.0));
+}
+

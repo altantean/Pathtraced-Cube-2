@@ -1,0 +1,296 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_nonuniform_qualifier : enable
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set=0,binding=0) uniform sampler2D uDepth;
+layout(set=0,binding=1) uniform sampler2D uNormal;
+layout(set=0,binding=2) uniform sampler2D uMotion;
+layout(set=0,binding=3,r8) uniform image2D uAO;
+layout(set=0,binding=4) uniform sampler2D uHistoryPrev;
+layout(set=0,binding=5,rgba16f) uniform image2D uHistoryNext;
+layout(set=0,binding=6) uniform accelerationStructureEXT uTLAS;
+layout(std140,set=0,binding=7) uniform Params {
+    mat4 invViewProj;
+    mat4 invView;
+    mat4 currentViewProjUnjittered;
+    mat4 prevViewProjJittered;
+    mat4 prevViewProjUnjittered;
+    vec4 settings;  // radius, intensity, bias, historyValid
+    uint frameIndex;
+    uint width;
+    uint height;
+    uint raysPerPixel;
+    vec4 shadowLightAndRadius;
+    uvec4 shadowData;
+} p;
+
+layout(set=0,binding=8,r8) uniform image2D uShadow;
+layout(set=0,binding=9) uniform sampler2D uShadowHistoryPrev;
+layout(set=0,binding=10,rgba16f) uniform image2D uShadowHistoryNext;
+layout(set=0,binding=11) uniform sampler2D uMomentsHistoryPrev;
+layout(set=0,binding=12,rgba16f) uniform image2D uMomentsHistoryNext;
+
+#define RT_MATERIALS_BINDING 13
+#define RT_TEXTURES_BINDING 14
+#include "rt_common.glsl"
+
+// traces one occlusion ray
+bool occluded(vec3 origin, vec3 dir, float tMax) {
+    rayQueryEXT q;
+    if (p.shadowData.z == 0u) {
+        rayQueryInitializeEXT(q, uTLAS, gl_RayFlagsOpaqueEXT | gl_RayFlagsTerminateOnFirstHitEXT, 0x7du, origin, 0.0, dir, tMax);
+        while (rayQueryProceedEXT(q)) { }
+    } else {
+        rayQueryInitializeEXT(q, uTLAS, gl_RayFlagsTerminateOnFirstHitEXT, 0x7du, origin, 0.0, dir, tMax);
+        while (rayQueryProceedEXT(q)) {
+            if (rayQueryGetIntersectionTypeEXT(q, false) == gl_RayQueryCandidateIntersectionTriangleEXT &&
+                rtCandidateOccludes(q)) {
+                rayQueryConfirmIntersectionEXT(q);
+            }
+        }
+    }
+    return rayQueryGetIntersectionTypeEXT(q, true) != gl_RayQueryCommittedIntersectionNoneEXT;
+}
+
+uint hash(uvec2 x) {
+    x *= uvec2(1664525u, 1013904223u);
+    x ^= x.yx >> 16;
+    x *= uvec2(2246822519u, 3266489917u);
+    x ^= x.yx >> 13;
+    return x.x ^ x.y;
+}
+
+vec2 rand2(uvec2 pix) {
+    uint h = hash(pix + uvec2(p.frameIndex * 1664525u));
+    return vec2(float(h & 0xffffu), float(h >> 16)) / 65535.0;
+}
+
+vec3 hemisphere(vec3 n, vec2 r) {
+    float phi = 6.28318530718 * r.x;
+    float z = sqrt(max(0.0, 1.0 - r.y));
+    float s = sqrt(max(0.0, r.y));
+    vec3 a = abs(n.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 t = normalize(cross(a,n));
+    vec3 b = cross(n,t);
+    return normalize(t * (cos(phi)*s) + b * (sin(phi)*s) + n * z);
+}
+
+vec2 octEncode(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 e = n.xy;
+    if (n.z < 0.0) e = (1.0 - abs(e.yx)) * sign(e.xy);
+    return e * 0.5 + 0.5;
+}
+
+vec3 octDecode(vec2 e) {
+    vec2 f = e * 2.0 - 1.0;
+    vec3 n = vec3(f, 1.0 - abs(f.x) - abs(f.y));
+    if (n.z < 0.0) n.xy = (1.0 - abs(n.yx)) * sign(n.xy);
+    return normalize(n);
+}
+
+void bilateralHistoryTaps(vec2 prevPixCoord, vec3 nWorld, float expectedPrevDepth,
+                           out ivec2 tap0, out ivec2 tap1, out ivec2 tap2, out ivec2 tap3,
+                           out vec4 weights) {
+    vec2 base = prevPixCoord - 0.5;  // hardware bilinear samples relative to the texel center grid
+    ivec2 i0 = ivec2(floor(base));
+    vec2 f = clamp(base - vec2(i0), 0.0, 1.0);
+    ivec2 sizeMinusOne = ivec2(p.width - 1u, p.height - 1u);
+    tap0 = clamp(i0 + ivec2(0, 0), ivec2(0), sizeMinusOne);
+    tap1 = clamp(i0 + ivec2(1, 0), ivec2(0), sizeMinusOne);
+    tap2 = clamp(i0 + ivec2(0, 1), ivec2(0), sizeMinusOne);
+    tap3 = clamp(i0 + ivec2(1, 1), ivec2(0), sizeMinusOne);
+
+    float bilinear0 = (1.0 - f.x) * (1.0 - f.y);
+    float bilinear1 = f.x * (1.0 - f.y);
+    float bilinear2 = (1.0 - f.x) * f.y;
+    float bilinear3 = f.x * f.y;
+
+    float depthThreshold = max(0.0015, abs(expectedPrevDepth) * 0.006);
+
+    vec4 sample0 = texelFetch(uHistoryPrev, tap0, 0);
+    vec4 sample1 = texelFetch(uHistoryPrev, tap1, 0);
+    vec4 sample2 = texelFetch(uHistoryPrev, tap2, 0);
+    vec4 sample3 = texelFetch(uHistoryPrev, tap3, 0);
+
+    bool valid0 = abs(sample0.g - expectedPrevDepth) <= depthThreshold && dot(octDecode(sample0.ba), nWorld) >= 0.94;
+    bool valid1 = abs(sample1.g - expectedPrevDepth) <= depthThreshold && dot(octDecode(sample1.ba), nWorld) >= 0.94;
+    bool valid2 = abs(sample2.g - expectedPrevDepth) <= depthThreshold && dot(octDecode(sample2.ba), nWorld) >= 0.94;
+    bool valid3 = abs(sample3.g - expectedPrevDepth) <= depthThreshold && dot(octDecode(sample3.ba), nWorld) >= 0.94;
+
+    weights = vec4(
+        valid0 ? bilinear0 : 0.0,
+        valid1 ? bilinear1 : 0.0,
+        valid2 ? bilinear2 : 0.0,
+        valid3 ? bilinear3 : 0.0);
+}
+
+float blendHistoryTaps(sampler2D tex, ivec2 tap0, ivec2 tap1, ivec2 tap2, ivec2 tap3,
+                        vec4 weights, float totalWeight) {
+    float weighted = texelFetch(tex, tap0, 0).r * weights.x +
+                      texelFetch(tex, tap1, 0).r * weights.y +
+                      texelFetch(tex, tap2, 0).r * weights.z +
+                      texelFetch(tex, tap3, 0).r * weights.w;
+    return weighted / totalWeight;
+}
+
+vec3 blendMomentsTaps(sampler2D tex, ivec2 tap0, ivec2 tap1, ivec2 tap2, ivec2 tap3,
+                       vec4 weights, float totalWeight) {
+    vec3 weighted = texelFetch(tex, tap0, 0).rgb * weights.x +
+                     texelFetch(tex, tap1, 0).rgb * weights.y +
+                     texelFetch(tex, tap2, 0).rgb * weights.z +
+                     texelFetch(tex, tap3, 0).rgb * weights.w;
+    return weighted / totalWeight;
+}
+
+float currentRtao(vec3 worldPos, vec3 nWorld, uvec2 pix) {
+    vec3 origin = worldPos + nWorld * p.settings.z;
+    uint rays = clamp(p.raysPerPixel, 1u, 32u);
+    float visibility = 0.0;
+    for (uint rayIndex = 0u; rayIndex < rays; ++rayIndex) {
+        vec2 r = rand2(pix + uvec2(rayIndex * 0x9e3779b9u, rayIndex * 0x85ebca6bu));
+        vec3 dir = hemisphere(nWorld, r);
+        visibility += occluded(origin, dir, p.settings.x) ? 0.0 : 1.0;
+    }
+    float ao = visibility / float(rays);
+    return clamp(mix(1.0, ao, clamp(p.settings.y, 0.0, 1.0)), 0.0, 1.0);
+}
+
+float traceShadow(vec3 worldPos, vec3 nWorld, uvec2 pix) {
+    vec3 L = normalize(-p.shadowLightAndRadius.xyz);
+    float shadowBias = max(0.01, p.settings.z * 1.5);
+    vec3 origin = worldPos + nWorld * shadowBias;
+    uint rays = clamp(p.shadowData.x, 1u, 8u);
+    float lightRadius = max(p.shadowLightAndRadius.w, 0.0);
+    vec3 tangent = abs(L.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 t = normalize(cross(tangent, L));
+    vec3 b = cross(L, t);
+    float visibility = 0.0;
+    for (uint rayIndex = 0u; rayIndex < rays; ++rayIndex) {
+        // stratify the disk samples by ray index
+        vec2 r = rand2(pix + uvec2(0x68bc21ebu + rayIndex * 0x27d4eb2fu,
+                                  0x9e3779b9u + rayIndex * 0x85ebca6bu));
+        float rotation = r.x;
+        float stratum = (float(rayIndex) + r.y) / float(rays);
+        float ang = 6.28318530718 * (rotation + float(rayIndex) * 0.61803398875);
+        float rad = lightRadius * sqrt(stratum);
+        vec3 dir = normalize(L + t * (cos(ang) * rad) + b * (sin(ang) * rad));
+        // surfaces facing away from the light are unconditionally shadowed, no ray needed
+        if (dot(nWorld, dir) <= 0.0) continue;
+        visibility += occluded(origin, dir, 10000.0) ? 0.0 : 1.0;
+    }
+    return visibility / float(rays);
+}
+
+void main() {
+    uvec2 pix = gl_GlobalInvocationID.xy;
+    if (pix.x >= p.width || pix.y >= p.height) return;
+
+    ivec2 ipix = ivec2(pix);
+    vec2 uv = (vec2(pix) + 0.5) / vec2(p.width, p.height);
+    float depth = texelFetch(uDepth, ipix, 0).r;
+    vec3 nView = texelFetch(uNormal, ipix, 0).xyz;
+
+    if (depth >= 0.999999 || dot(nView,nView) < 1e-6) {
+        imageStore(uAO, ipix, vec4(1.0));
+        imageStore(uHistoryNext, ipix, vec4(1.0, depth, 0.5, 0.5));
+        imageStore(uShadow, ipix, vec4(1.0));
+        imageStore(uShadowHistoryNext, ipix, vec4(1.0, depth, 0.5, 0.5));
+        imageStore(uMomentsHistoryNext, ipix, vec4(1.0, 1.0, 1.0, 0.0));
+        return;
+    }
+
+    vec4 clip = vec4(uv * 2.0 - 1.0, depth * 2.0 - 1.0, 1.0);
+    vec4 worldH = p.invViewProj * clip;
+    vec3 worldPos = worldH.xyz / worldH.w;
+    vec3 nWorld = normalize((p.invView * vec4(nView,0.0)).xyz);
+
+    float current = currentRtao(worldPos, nWorld, pix);
+    float result = current;
+
+    bool shadowActive = p.shadowData.y != 0u;
+    float currentShadow = shadowActive ? traceShadow(worldPos, nWorld, pix) : 1.0;
+    float shadowResult = currentShadow;
+
+    // measured temporal variance (moment2 - mean^2), driving this frame's temporal blend weight below
+    const float RTAO_MAX_HISTORY_SAMPLES = 32.0;
+    float newSampleCount = 1.0;
+    float newAoMoment2 = current * current;
+    float newShadowMoment2 = currentShadow * currentShadow;
+
+    if (p.settings.w > 0.5) {
+
+        // current depth was rasterized with the current jittered projection
+        vec4 prevClipJittered = p.prevViewProjJittered * worldH;
+        bool validPrevProjection = prevClipJittered.w > 1e-6;
+        vec2 expectedPrevUv = prevClipJittered.xy / prevClipJittered.w * 0.5 + 0.5;
+        float expectedPrevDepth = prevClipJittered.z / prevClipJittered.w * 0.5 + 0.5;
+
+        if (validPrevProjection &&
+            all(greaterThanEqual(expectedPrevUv, vec2(0.0))) &&
+            all(lessThanEqual(expectedPrevUv, vec2(1.0)))) {
+            vec2 prevPixCoord = expectedPrevUv * vec2(p.width, p.height);
+            ivec2 tap0, tap1, tap2, tap3;
+            vec4 tapWeights;
+            bilateralHistoryTaps(prevPixCoord, nWorld, expectedPrevDepth, tap0, tap1, tap2, tap3, tapWeights);
+            float totalTapWeight = tapWeights.x + tapWeights.y + tapWeights.z + tapWeights.w;
+
+            // the engine's motion vectors are explicitly unjittered -> unjittered (previousUv -
+            // currentUv)
+            vec4 currentClipUnjittered = p.currentViewProjUnjittered * worldH;
+            vec4 prevClipUnjittered = p.prevViewProjUnjittered * worldH;
+            bool validMotionProjection = currentClipUnjittered.w > 1e-6 && prevClipUnjittered.w > 1e-6;
+            float motionConsistency = 1.0;
+            if (validMotionProjection) {
+                vec2 currentUnjUv = currentClipUnjittered.xy / currentClipUnjittered.w * 0.5 + 0.5;
+                vec2 prevUnjUv = prevClipUnjittered.xy / prevClipUnjittered.w * 0.5 + 0.5;
+                vec2 expectedMotion = prevUnjUv - currentUnjUv;
+                vec2 motion = texelFetch(uMotion, ipix, 0).xy;
+                float motionErrorPixels = length((motion - expectedMotion) * vec2(float(p.width), float(p.height)));
+                motionConsistency = exp(-0.5 * (motionErrorPixels * motionErrorPixels) / (2.5 * 2.5));
+            }
+
+            if (totalTapWeight > 1e-4) {
+                float motionPixels = length((expectedPrevUv - uv) *
+                                            vec2(float(p.width), float(p.height)));
+                float motionFade = smoothstep(1.0, 18.0, motionPixels);
+                float historyWeight = mix(0.88, 0.30, motionFade) * motionConsistency;
+
+                vec3 historyMoments = blendMomentsTaps(uMomentsHistoryPrev, tap0, tap1, tap2, tap3, tapWeights, totalTapWeight);
+                float historySampleCount = historyMoments.z;
+                newSampleCount = min(historySampleCount + 1.0, RTAO_MAX_HISTORY_SAMPLES);
+
+                float clampedWeight = clamp(historyWeight, 0.0, 0.90);
+                float alphaAo = max(1.0 / newSampleCount, 1.0 - clampedWeight);
+                float historyAo = blendHistoryTaps(uHistoryPrev, tap0, tap1, tap2, tap3, tapWeights, totalTapWeight);
+                result = mix(historyAo, current, alphaAo);
+                newAoMoment2 = mix(historyMoments.x, current * current, alphaAo);
+
+                if (shadowActive) {
+                    float shadowClampedWeight = clamp(historyWeight, 0.0, 0.85);
+                    float alphaShadow = max(1.0 / newSampleCount, 1.0 - shadowClampedWeight);
+                    float historyShadow = blendHistoryTaps(uShadowHistoryPrev, tap0, tap1, tap2, tap3, tapWeights, totalTapWeight);
+                    shadowResult = mix(historyShadow, currentShadow, alphaShadow);
+                    newShadowMoment2 = mix(historyMoments.y, currentShadow * currentShadow, alphaShadow);
+                }
+            }
+        }
+    }
+
+    result = clamp(result, 0.0, 1.0);
+    imageStore(uAO, ipix, vec4(result));
+    vec2 encodedNormal = octEncode(nWorld);
+    imageStore(uHistoryNext, ipix, vec4(result, depth, encodedNormal));
+
+    shadowResult = clamp(shadowResult, 0.0, 1.0);
+    imageStore(uShadow, ipix, vec4(shadowResult));
+    imageStore(uShadowHistoryNext, ipix, vec4(shadowResult, depth, encodedNormal));
+
+    imageStore(uMomentsHistoryNext, ipix, vec4(newAoMoment2, newShadowMoment2, newSampleCount, 0.0));
+}

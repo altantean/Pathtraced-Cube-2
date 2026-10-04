@@ -1,0 +1,72 @@
+#version 460
+// volfog_integrate.comp, Volumetric fog, pass 2 of 2 ("integrate")
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std140, set = 0, binding = 1) uniform VolFogParams {
+    mat4 invViewProj;
+    mat4 prevViewProj;
+    uvec4 frameData;
+    vec4 sunDirectionRadius;
+    vec4 sunColorPad;
+    vec4 skyAmbientPad;
+    uvec4 gridDims;
+    vec4 nearFarParams;
+    vec4 fogDensityParams;
+    vec4 phaseAndNoise;
+    vec4 camWorldPosPad;
+    vec4 camForwardPad;  // layout parity only
+    vec4 mediumOverride;
+} p;
+
+layout(set = 0, binding = 4, rgba16f) readonly uniform image3D uFroxelScatterExtinction;
+layout(set = 0, binding = 5, rgba16f) writeonly uniform image3D uFroxelIntegrated;
+
+// same formula as volfog_inject.comp's froxelSliceViewZ(), must stay in sync
+float froxelSliceViewZ(float slice, float zCount, float nearZ, float farZ) {
+    return nearZ * pow(farZ / nearZ, slice / zCount);
+}
+
+float oneMinusExpOverX(float x) {
+    // 4-term Taylor series of (1-e^-x)/x = 1 - x/2 + x^2/6 - x^3/24 +
+    if (x < 1e-2) {
+        return 1.0 - x * (0.5 - x * (1.0/6.0 - x * (1.0/24.0)));
+    }
+    return (1.0 - exp(-x)) / x;
+}
+
+void main() {
+    uvec2 col = gl_GlobalInvocationID.xy;
+    uvec3 dims = p.gridDims.xyz;
+    if (any(greaterThanEqual(col, dims.xy))) return;
+
+    if (p.nearFarParams.w > 4.5) {
+        for (uint z = 0u; z < dims.z; ++z) {
+            vec4 texel = imageLoad(uFroxelScatterExtinction, ivec3(col, z));
+            imageStore(uFroxelIntegrated, ivec3(col, z), vec4(texel.rgb, 1.0));
+        }
+        return;
+    }
+
+    vec3 accumInscatter = vec3(0.0);
+    float transmittance = 1.0;
+    float prevBoundary = p.nearFarParams.x;  // near edge of slice 0
+
+    for (uint z = 0u; z < dims.z; ++z) {
+        vec4 texel = imageLoad(uFroxelScatterExtinction, ivec3(col, z));
+        vec3 inscatter = texel.rgb;
+        float extinction = texel.a;
+
+        float farBoundary = froxelSliceViewZ(float(z) + 1.0, float(dims.z), p.nearFarParams.x, p.nearFarParams.y);
+        float thickness = max(farBoundary - prevBoundary, 1e-4);
+        prevBoundary = farBoundary;
+
+        float x = extinction * thickness;
+        float sliceTransmittance = exp(-x);
+        vec3 sliceLight = inscatter * thickness * oneMinusExpOverX(x);
+        accumInscatter += transmittance * sliceLight;
+        transmittance *= sliceTransmittance;
+
+        imageStore(uFroxelIntegrated, ivec3(col, z), vec4(accumInscatter, transmittance));
+    }
+}

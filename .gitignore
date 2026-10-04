@@ -1,0 +1,35 @@
+# visual studio / build output
+src/vcpp/.vs/
+src/vcpp/Debug64/
+src/vcpp/Release64/
+src/vcpp/Debug/
+src/vcpp/Release/
+src/vcpp/x64/
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.ipch
+*.exp
+*.tlog
+*.ncb
+*.sdf
+*.suo
+*.user
+*.aps
+*.db
+*.map
+
+# built by the build, not checked in
+bin64/*.exe
+bin64/streamline/
+gl_vk_interop_v2/shaders/*.spv
+dist/
+
+# game content, too big for git: copy it in from the release zip
+packages/
+
+# runtime output
+*.log
+*.dmp
+log.txt

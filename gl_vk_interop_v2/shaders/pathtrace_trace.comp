@@ -1,0 +1,2869 @@
+#version 460
+// pathtrace_trace.comp, Sauerbraten path tracing, pass 1 of 2 ("trace")
+#ifdef PT_PROFILE
+#extension GL_ARB_shader_clock : require
+#endif
+// this same shader as a ray-generation shader, run by a one-shader ray-tracing pipeline (ptraygen)
+#ifdef PT_RAYGEN
+#extension GL_EXT_ray_tracing : require
+#endif
+#if defined(PT_SER) && defined(PT_SER_NV)
+#extension GL_NV_shader_invocation_reorder : require
+#define SER_REORDER(hint, bits) reorderThreadNV(hint, bits)
+#elif defined(PT_SER)
+#extension GL_EXT_shader_invocation_reorder : require
+#define SER_REORDER(hint, bits) reorderThreadEXT(hint, bits)
+#endif
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_nonuniform_qualifier : require
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#if !defined(RADIANCE_CACHE_PASS) && !defined(SKY_CDF_PASS) && !defined(PT_RAYGEN)
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#endif
+
+layout(set = 0, binding = 0) uniform sampler2D uDepth;
+layout(set = 0, binding = 1) uniform sampler2D uNormal;
+layout(set = 0, binding = 2) uniform sampler2D uAlbedo;
+layout(set = 0, binding = 3) uniform accelerationStructureEXT uTlas;
+
+// 12 floats (3 vec4s) per light
+struct PathTraceLight {
+    vec4 posRadius;
+    vec4 colorFlags;  // xyz = color, w = flag bits
+    vec4 reserved;
+};
+layout(std430, set = 0, binding = 4) readonly buffer LightBuffer {
+    PathTraceLight lights[];
+};
+#include "rt_lightshape.glsl"  // capsule / sphere lights
+float lightFacing(uint li, vec3 fromLightDir) {
+    vec3 n = lightDiscFacing(lights[li].colorFlags, lights[li].reserved);
+    return dot(n, n) > 0.25 ? abs(dot(fromLightDir, n)) : 1.0;
+}
+
+#define RT_MATERIALS_BINDING 5
+#define RT_TEXTURES_BINDING 13
+#include "rt_common.glsl"
+// the FFT sea (this frame's cascades) and its depth/fetch wave map, rt_water.glsl
+layout(set = 0, binding = 31) uniform sampler2DArray uWaveFft;
+layout(set = 0, binding = 32) uniform sampler2D uWaveMap;
+#include "rt_water.glsl"
+
+layout(std140, set = 0, binding = 6) uniform Params {
+    mat4 invViewProj;
+    mat4 invView;
+    mat4 resolveInvViewProj;
+    uvec4 frameData;  // frameIndex, bounceCount, historyValid(0/1), lightCount
+    vec4 sunDirectionRadius;
+    vec4 sunColorPad;
+    vec4 skyAmbientPad;
+    vec4 ambientFloorPad;
+    // [0] = total emissive power
+    vec4 emissiveImportancePad;
+    // the forward (non-inverted) view-projection matrix
+    mat4 viewProj;
+    mat4 prevViewProjJittered;
+    // sky hit sampling
+    uvec4 skyFaceIndexLo;
+    uvec4 skyFaceIndexHi;
+    vec4 skyRotationPad;
+    vec4 pomParams;
+    vec4 glassParams;
+    vec4 causticParams;
+    vec4 causticParams2;
+    vec4 waterParams;
+    vec4 waterCamera;  // rgb = the camera's water colour, w = its getwaterfog depth
+    vec4 waterParams2;
+    vec4 cacheParams;
+    vec4 cacheParams2;
+    vec4 skyParams;
+    vec4 matParams;
+    vec4 particleParams;  // x = sprite brightness in reflections/refractions (ptpartreflect)
+    vec4 waterPatch;
+    vec4 waterWave;
+    vec4 waterFft;  // rt_water.glsl
+    vec4 waterMap;  // rt_water.glsl
+    vec4 lava0;
+    vec4 lava1;
+    vec4 waterVolume;
+    vec4 rrParams;
+    vec4 lavaPatch;
+} p;
+
+layout(set = 0, binding = 14, rgba32f) writeonly uniform image2D uRawRadiance;
+
+// Sauerbraten-VSlot-indexed material table
+struct MaterialInfo {
+    uint diffuseTexIndex;
+    // repurposed (data, not a texture index) for any material with MATFLAG_WATER set
+    uint normalTexIndex;
+    uint glowTexIndex;
+    uint flags;
+    vec4 colorscale;  // rgb, metalness
+    vec4 glowcolor;  // rgb, pad
+    vec4 parallax;
+    vec4 scroll;  // xy = UV units per second (texscroll, lava flow), uv + scroll * time
+};
+layout(std430, set = 0, binding = 15) readonly buffer MaterialInfoBuffer {
+    MaterialInfo materialInfos[];
+};
+const uint MATFLAG_SPEC = 1u;
+const uint MATFLAG_NORMAL = 2u;
+const uint MATFLAG_GLOW = 4u;
+const uint MATFLAG_GLASS = 8u;
+// a separate dielectric flag from MATFLAG_GLASS
+const uint MATFLAG_WATER = 16u;
+// specular shader without a spec map (specworld, bumpspecworld, ...)
+const uint MATFLAG_UNIFORMSPEC = 32u;
+// parallax shader
+const uint MATFLAG_PARALLAX = 64u;
+const uint MATFLAG_LAVA = 128u;
+
+vec3 glassVolumeTint(vec3 glassColor) {
+    float m = max(glassColor.r, max(glassColor.g, glassColor.b));
+    vec3 hue = m > 1e-3 ? glassColor / m : vec3(1.0);
+    return mix(vec3(1.0), hue, clamp(p.glassParams.x, 0.0, 1.0));
+}
+const float SPEC_SCALE_MAX = 4.0;
+float decodeSpecScale(uint flags) {
+    return float((flags >> 8u) & 0xFFu) / 255.0 * SPEC_SCALE_MAX;
+}
+
+// emissive (glow-carrying) world-space triangles
+struct EmissiveTriangle {
+    vec4 v0;
+    vec4 v1;
+    vec4 v2;
+    vec4 radiance;
+};
+layout(std430, set = 0, binding = 16) readonly buffer EmissiveBuffer {
+    EmissiveTriangle emissiveTriangles[];
+};
+
+layout(set = 0, binding = 17) uniform sampler2D uGlow;
+
+layout(set = 0, binding = 18, rgba16f) writeonly uniform image2D uPrimaryNormalOut;
+layout(set = 0, binding = 19, rg16f) writeonly uniform image2D uLinearDepthOut;
+
+// caustics (ptcaustics) water caustics, hybrid bidirectional
+struct CausticPhoton {
+    vec4 posNext;
+    vec4 powerKey;  // xyz flux (directLighting() units), w = cell key (uint bits)
+    vec4 normal;  // xyz receiving surface normal
+};
+layout(std430, set = 0, binding = 20) buffer CausticPhotonBuf { uvec4 causticHeader[8]; CausticPhoton causticPhotons[]; };  // header[b].x = batch b's photon count
+layout(std430, set = 0, binding = 21) buffer CausticHashBuf { uint causticHeads[]; };
+struct CausticEmitter { vec4 v0cdf; vec4 v1; vec4 v2; };  // triangle corners
+layout(std430, set = 0, binding = 22) readonly buffer CausticEmitterBuf { vec4 causticEmitterHeader; CausticEmitter causticEmitters[]; };
+const uint CAUSTIC_BATCHES = 8u;  // keep in sync with RayTracingScene's kCausticBatches
+
+#define PATH_TRACE_DEBUG_TEXTURE_INDEX 0
+
+#define PATH_TRACE_DEBUG_METALNESS 0
+
+const float PI = 3.14159265358979323846;
+
+uint pcgHash(uint x) {
+    x = x * 747796405u + 2891336453u;
+    uint w = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+float randFloat(inout uint seed) {
+    seed = pcgHash(seed);
+    return float(seed) * (1.0 / 4294967296.0);
+}
+
+ivec2 gPixel;
+uint gBounce;
+// TLAS instance masks
+const uint RAYMASK_WORLD = 0x7Du;
+const uint RAYMASK_PARTICLE = 0x80u;
+const uint PARTICLE_MATERIAL = 0xFFFFFFFEu;
+// sample index within this pixel's samples-per-pixel loop (pathtracespp)
+uint gSample = 0u;
+// specular weight of the current shading vertex
+float gSpecWeight = 1.0;
+
+vec2 blueNoise2D(uint dimensionTag) {
+    uint dim = dimensionTag * 16u + gBounce + gSample * 4099u;
+    uint bnIdx = p.skyFaceIndexHi.w;
+    if (bnIdx != 0xFFFFFFFFu) {
+        // temporal
+        uint h = pcgHash(dim * 0x9E3779B9u + 0x68E31DA4u ^ pcgHash(p.frameData.x * 0x85EBCA6Bu + 0x27D4EB2Fu));
+        ivec2 shift = ivec2(int(h & 63u), int((h >> 6u) & 63u));
+        vec2 bn = texelFetch(uMapTextures[nonuniformEXT(bnIdx)], (gPixel + shift) & ivec2(63), 0).rg;
+        bn += (0.5 / 256.0);  // centre of each 8-bit bucket
+        uint hv = pcgHash(h ^ 0xB5297A4Du);
+        vec2 rot = vec2(float(hv & 0xFFFFu), float(hv >> 16u)) * (1.0 / 65536.0);
+        return fract(bn + rot);
+    }
+    uint baseSeed = uint(gPixel.x) * 1973u ^ uint(gPixel.y) * 9277u ^ dim * 26699u ^ p.frameData.x * 83492791u;
+    uint h1 = pcgHash(baseSeed);
+    uint h2 = pcgHash(baseSeed ^ 0x9E3779B9u);
+    return vec2(float(h1) * (1.0 / 4294967296.0), float(h2) * (1.0 / 4294967296.0));
+}
+
+void buildBasis(vec3 n, out vec3 tangent, out vec3 bitangent) {
+    vec3 up = abs(n.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(1.0, 0.0, 0.0);
+    tangent = normalize(cross(up, n));
+    bitangent = cross(n, tangent);
+}
+
+// cosine-weighted hemisphere sample around n
+vec3 cosineSampleHemisphere(vec3 n, inout uint seed) {
+    vec2 u = blueNoise2D(0u);
+    randFloat(seed); randFloat(seed);
+    float u1 = u.x, u2 = u.y;
+    float r = sqrt(u1);
+    float theta = 6.28318530718 * u2;
+    vec3 tangent, bitangent;
+    buildBasis(n, tangent, bitangent);
+    vec3 dir = tangent * (r * cos(theta)) + bitangent * (r * sin(theta)) + n * sqrt(max(0.0, 1.0 - u1));
+    return normalize(dir);
+}
+
+vec3 jitterSunDirection(vec3 sunDir, float angularRadius, inout uint seed) {
+    if (angularRadius <= 0.0) return sunDir;
+    vec2 u = blueNoise2D(1u);
+    randFloat(seed); randFloat(seed);
+    float u1 = u.x, u2 = u.y;
+    float r = angularRadius * sqrt(u1);
+    float theta = 6.28318530718 * u2;
+    vec3 tangent, bitangent;
+    buildBasis(sunDir, tangent, bitangent);
+    return normalize(sunDir + tangent * (r * cos(theta)) + bitangent * (r * sin(theta)));
+}
+
+vec3 traceShadowRayTinted(vec3 origin, vec3 dir, float maxDist);
+// set by directLighting() around its sun shadow ray
+float gShadowWaterCaustic = 0.0;
+bool gCausticGatherHere = false;
+
+bool gPrimaryGradRequest = false;  // set only around the primary hit's fetch
+vec3 gPrimRayOrigin, gPrimDirDx, gPrimDirDy;
+bool gUseGrad = false;  // this fetch has valid derivatives
+vec2 gUvDx, gUvDy;  // d(uv)/dx, d(uv)/dy of the hit's main UV
+vec3 gDBaryDx, gDBaryDy;  // barycentric derivatives (for other UV sets)
+
+vec3 rtBarycentric(vec3 pt, vec3 a, vec3 b, vec3 c) {
+    vec3 e0 = b - a, e1 = c - a, e2 = pt - a;
+    float d00 = dot(e0, e0), d01 = dot(e0, e1), d11 = dot(e1, e1), d20 = dot(e2, e0), d21 = dot(e2, e1);
+    float den = d00 * d11 - d01 * d01;
+    if (abs(den) < 1e-20) return vec3(1.0, 0.0, 0.0);
+    float bv = (d11 * d20 - d01 * d21) / den, bw = (d00 * d21 - d01 * d20) / den;
+    return vec3(1.0 - bv - bw, bv, bw);
+}
+
+const float SAUER_LIGHTMAP_OVERBRIGHT = 2.0;
+
+const float SAUER_BRDF_PI_COMPENSATION = PI;
+
+// ============================================================ pbr materials
+
+const float ROUGHNESS_MIN = 0.05;
+const float ROUGHNESS_MAX = 0.9;
+const vec3 DIELECTRIC_F0 = vec3(0.04);
+
+float specIntensityToRoughness(float specIntensity) {
+    return clamp(mix(ROUGHNESS_MAX, ROUGHNESS_MIN, clamp(specIntensity, 0.0, 1.0)), ROUGHNESS_MIN, ROUGHNESS_MAX);
+}
+
+// material model (ptmat 1) Sauerbraten's authored specular, translated physically
+const float MAT_MIRROR_KS = 1600.0;
+vec3 transportAlbedo(vec3 a) {
+    if (p.matParams.y < 0.5) return a;
+    float lum = dot(a, vec3(0.2126, 0.7152, 0.0722));  // luminance(), defined further down
+    if (lum <= 1e-5) return a;
+    float e = clamp(p.matParams.z, 1.0, 2.2) / 2.2;
+    return min(a * (pow(lum, e) / lum), vec3(0.9));
+}
+
+vec3 displayToTransportRatio(vec3 a) {
+    if (p.matParams.y < 0.5) return vec3(1.0);
+    vec3 r = transportAlbedo(a) / max(a, vec3(1e-4));
+    return mix(vec3(1.0), clamp(r, vec3(0.05), vec3(100.0)), greaterThan(a, vec3(1e-4)));
+}
+bool finite3(vec3 v) { return !any(isnan(v)) && !any(isinf(v)); }
+float materialRoughness(float ks);
+// A vertex's roughness
+float surfaceRoughness(float ks, float roughOverride) {
+    return roughOverride >= 0.0 ? max(roughOverride, ROUGHNESS_MIN) : materialRoughness(ks);
+}
+float materialRoughness(float ks) {
+    if (p.matParams.x < 0.5) return specIntensityToRoughness(clamp(ks, 0.0, 1.0));
+    float a = clamp(0.1 / sqrt(max(ks, 1e-6)), ROUGHNESS_MIN * ROUGHNESS_MIN, ROUGHNESS_MAX * ROUGHNESS_MAX);
+    return sqrt(a);
+}
+
+float luminance(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+float ggxD(float NdotH, float alpha) {
+    float a2 = alpha * alpha;
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(PI * d * d, 1e-8);
+}
+
+float smithG1(float NdotX, float alpha) {
+    float a2 = alpha * alpha;
+    return 2.0 * NdotX / max(NdotX + sqrt(a2 + (1.0 - a2) * NdotX * NdotX), 1e-6);
+}
+
+float smithG(float NdotV, float NdotL, float alpha) {
+    return smithG1(NdotV, alpha) * smithG1(NdotL, alpha);
+}
+
+vec3 fresnelSchlick(float cosTheta, vec3 F0) {
+    float m = clamp(1.0 - cosTheta, 0.0, 1.0);
+    return F0 + (vec3(1.0) - F0) * (m * m * m * m * m);
+}
+
+// probability of choosing the specular lobe when sampling a bounce direction
+float specularLobeProbability(float roughness, float metalness) {
+    float t = clamp((roughness - ROUGHNESS_MIN) / max(ROUGHNESS_MAX - ROUGHNESS_MIN, 1e-4), 0.0, 1.0);
+    float dielectricProb = mix(0.85, 0.05, t) * gSpecWeight;
+    return mix(dielectricProb, 1.0, metalness);
+}
+
+vec3 evalBsdf(vec3 N, vec3 V, vec3 L, vec3 albedo, vec3 F0, float roughness, float metalness, out float pdf) {
+    float NdotL = dot(N, L);
+    float NdotV = max(dot(N, V), 1e-4);
+    if (NdotL <= 0.0) { pdf = 0.0; return vec3(0.0); }
+    vec3 H = normalize(V + L);
+    float NdotH = max(dot(N, H), 0.0);
+    float VdotH = max(dot(V, H), 0.0);
+    float alpha = max(roughness * roughness, 0.0016);
+    vec3 F = fresnelSchlick(VdotH, F0);
+    float D = ggxD(NdotH, alpha);
+    float G = smithG(NdotV, NdotL, alpha);
+    F *= gSpecWeight;
+    vec3 specular = (D * G) * F / max(4.0 * NdotV * NdotL, 1e-6);
+    // energy conservation
+    vec3 diffuse = (vec3(1.0) - F) * albedo * (1.0 - metalness) / PI;
+    float pdfDiffuse = NdotL / PI;
+    float pdfSpecular = D * NdotH / max(4.0 * VdotH, 1e-6);
+    float specProb = specularLobeProbability(roughness, metalness);
+    pdf = mix(pdfDiffuse, pdfSpecular, specProb);
+    return diffuse + specular;
+}
+
+vec3 sampleBsdfDirection(vec3 N, vec3 V, vec3 albedo, vec3 F0, float roughness, float metalness, inout uint seed,
+                          out vec3 throughputMul, out float pdfOut) {
+    float specProb = specularLobeProbability(roughness, metalness);
+    vec3 L;
+    if (blueNoise2D(3u).x < specProb) {
+        vec3 tangent, bitangent;
+        buildBasis(N, tangent, bitangent);
+        vec2 ggxU = blueNoise2D(4u);
+        float u1 = ggxU.x;
+        float u2 = ggxU.y;
+        float alpha = max(roughness * roughness, 0.0016);
+        float phi = 6.28318530718 * u1;
+        float cosTheta = sqrt(max(0.0, (1.0 - u2) / (1.0 + (alpha * alpha - 1.0) * u2)));
+        float sinTheta = sqrt(max(0.0, 1.0 - cosTheta * cosTheta));
+        vec3 Hlocal = vec3(sinTheta * cos(phi), sinTheta * sin(phi), cosTheta);
+        vec3 H = normalize(tangent * Hlocal.x + bitangent * Hlocal.y + N * Hlocal.z);
+        L = reflect(-V, H);
+    } else {
+        L = cosineSampleHemisphere(N, seed);
+    }
+    if (dot(N, L) <= 0.0) { throughputMul = vec3(0.0); pdfOut = 0.0; return L; }
+    float pdf;
+    vec3 f = evalBsdf(N, V, L, albedo, F0, roughness, metalness, pdf);
+    if (pdf > 1e-8) {
+        throughputMul = f * dot(N, L) / pdf;
+        pdfOut = pdf;
+    } else {
+        throughputMul = vec3(0.0);
+        pdfOut = 0.0;
+    }
+    return L;
+}
+
+const float IOR_GLASS = 1.5;
+const float IOR_WATER = 1.33;
+
+// dielectric (glass) BSDF
+vec3 waterSigma(vec3 color, float fogDepth) {
+    float d = max(fogDepth, 1.0) * max(p.waterParams.y, 0.01);
+    return -log(clamp(color, vec3(0.02), vec3(0.98))) / d;
+}
+vec3 waterScatterRadiance(vec3 color) {
+    return color * (p.skyAmbientPad.xyz + p.sunColorPad.xyz * (p.waterVolume.x > 0.0 ? 0.0 : 0.25)) * p.waterParams2.x;
+}
+// rt_water.glsl's amp
+vec4 waterAmp() { return vec4(p.waterParams.z, p.waterWave.y, 0.0, p.waterWave.w); }
+// the FFT sea's normal (rt_water.glsl) on a top / bottom face
+vec3 waterWaveNormal(vec3 pos, vec3 n) {
+    if (p.waterParams.z <= 0.0 || abs(n.z) < 0.5) return n;
+    vec3 wn = waterWaveNormalAt(pos.xy, p.waterFft, p.waterMap, waterAmp(), 1.0);
+    return n.z > 0.0 ? wn : vec3(wn.xy, -wn.z);
+}
+// inside the patch the displaced surface (water_patch.comp) replaces the flat water chunk
+bool waterPatchHides(rayQueryEXT rq) {
+    if (p.waterPatch.z <= 0.0) return false;
+    int inst = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+    float prim = float(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+    bool flatWater = inst == int(p.waterPatch.w) && prim < p.waterWave.z;
+    bool flatLava = inst == int(p.lavaPatch.x) && prim < p.lavaPatch.y;
+    if (!flatWater && !flatLava) return false;
+    vec3 hp = rayQueryGetWorldRayOriginEXT(rq) + rayQueryGetWorldRayDirectionEXT(rq) * rayQueryGetIntersectionTEXT(rq, false);
+    vec2 d = hp.xy - p.waterPatch.xy;
+    return d.x >= 0.0 && d.y >= 0.0 && d.x < p.waterPatch.z && d.y < p.waterPatch.z;
+}
+// underwater shadow rays
+bool gHitIsGrass = false;
+bool gShadeGrass = false;
+vec3 gShadowWaterSigma = vec3(0.0);
+float gShadowWaterSurfaceZ = 0.0;
+// distance along dir from o to the water plane at surfaceZ (1e30 if the ray never rises through it)
+float waterPlaneT(vec3 o, vec3 dir, float surfaceZ) {
+    return dir.z > 1e-5 ? max((surfaceZ - o.z) / dir.z, 0.0) : 1e30;
+}
+
+vec3 sampleGlassBsdf(vec3 N, vec3 rayDir, bool entering, float iorInside, inout vec3 throughput, inout uint seed, bool water) {
+    float iorFrom = entering ? 1.0 : iorInside;
+    float iorTo = entering ? iorInside : 1.0;
+    float eta = iorFrom / iorTo;
+
+    float cosI = clamp(dot(-rayDir, N), 0.0, 1.0);
+    float thinness = water ? 0.0 : clamp(p.emissiveImportancePad.w, 0.0, 1.0);
+    if (!entering && thinness > 0.0) {
+        float sinI = sqrt(max(0.0, 1.0 - cosI * cosI)) * mix(1.0, 1.0 / iorInside, thinness);
+        cosI = sqrt(max(0.0, 1.0 - sinI * sinI));
+    }
+    float sin2T = eta * eta * max(0.0, 1.0 - cosI * cosI);
+
+    float fresnel;
+    if (sin2T >= 1.0) {
+        fresnel = 1.0;
+    } else {
+        float cosT = sqrt(max(0.0, 1.0 - sin2T));
+        float rs = (iorFrom * cosI - iorTo * cosT) / max(iorFrom * cosI + iorTo * cosT, 1e-6);
+        float rp = (iorTo * cosI - iorFrom * cosT) / max(iorTo * cosI + iorFrom * cosT, 1e-6);
+        fresnel = clamp(0.5 * (rs * rs + rp * rp), 0.0, 1.0);
+    }
+    if (!water) fresnel = entering ? mix(fresnel, 2.0 * fresnel / (1.0 + fresnel), thinness) : fresnel * (1.0 - thinness);
+
+    if (randFloat(seed) < fresnel) {
+        return reflect(rayDir, N);
+    }
+    vec3 refracted = refract(rayDir, N, eta);
+    // exit face of a thin pane
+    if (dot(refracted, refracted) < 0.5) refracted = rayDir;
+    // blend the Snell's-law-refracted direction toward the original unbent incident direction
+    vec3 thinDir = normalize(mix(refracted, rayDir, thinness));
+    if (!water) throughput *= mix(eta * eta, 1.0, thinness);
+    return thinDir;
+}
+
+// fetches the Sauerbraten material description for a vertex's materialIndex (its VSlot index)
+MaterialInfo fetchMaterialInfo(uint materialIndex) {
+    if (materialIndex < materialInfos.length()) return materialInfos[materialIndex];
+    MaterialInfo fallback;
+    fallback.diffuseTexIndex = 0u;
+    fallback.normalTexIndex = 0u;
+    fallback.glowTexIndex = 0u;
+    fallback.flags = 0u;
+    // colorscale.w is repurposed to carry metalness
+    fallback.colorscale = vec4(1.0, 1.0, 1.0, 0.0);
+    fallback.glowcolor = vec4(1.0);
+    fallback.scroll = vec4(0.0);
+    fallback.parallax = vec4(0.0);
+    return fallback;
+}
+
+// glass-aware shadow/visibility ray
+const uint MAX_GLASS_SHADOW_HITS = 4u;
+
+layout(std430, set = 0, binding = 25) buffer RayStatsBuf { uint rayStats[64]; };
+// radiance cache world-space multi-bounce GI (no ReSTIR, no RIS)
+layout(std430, set = 0, binding = 27) buffer RcKeyBuf { uvec2 rcKeys[]; };  // x = checksum (0 = empty), y = frame last written
+layout(std430, set = 0, binding = 28) buffer RcAccumBuf { uvec4 rcAccum[]; };  // rgb * RC_SCALE, sample count, this frame
+layout(std430, set = 0, binding = 29) buffer RcRadianceBuf { vec4 rcRadiance[]; };  // rgb, frames of data (capped)
+const uint RC_SIZE = 1u << 20;  // keep in sync with RayTracingScene::kRadianceCacheSize
+const uint RC_MASK = RC_SIZE - 1u;
+const float RC_SCALE = 256.0;
+const uint RC_PROBES = 8u;
+
+// cell of a surface point
+void rcCell(vec3 pos, vec3 n, vec3 camPos, out uint slot0, out uint check) {
+    float dist = length(pos - camPos);
+    int level = clamp(int(floor(log2(max(dist, 1.0) / 32.0))), 0, 10);
+    float cell = max(p.cacheParams.y, 0.25) * float(1 << level);
+    ivec3 q = ivec3(floor(pos / cell));
+    vec3 an = abs(n);
+    uint nd = (an.x >= an.y && an.x >= an.z) ? (n.x > 0.0 ? 0u : 1u) : ((an.y >= an.z) ? (n.y > 0.0 ? 2u : 3u) : (n.z > 0.0 ? 4u : 5u));
+    uint h = pcgHash(uint(q.x) ^ pcgHash(uint(q.y) ^ pcgHash(uint(q.z) ^ pcgHash(uint(level) * 8u + nd))));
+    slot0 = h & RC_MASK;
+    check = pcgHash(h ^ 0x68E31DA4u ^ (uint(q.x) * 73856093u) ^ (uint(q.z) * 19349663u)) | 1u;
+}
+int rcFind(uint slot0, uint check) {
+    for (uint i = 0u; i < RC_PROBES; ++i) {
+        uint sl = (slot0 + i) & RC_MASK;
+        uint k = rcKeys[sl].x;
+        if (k == check) return int(sl);
+        if (k == 0u) return -1;
+    }
+    return -1;
+}
+int rcInsert(uint slot0, uint check) {
+    for (uint i = 0u; i < RC_PROBES; ++i) {
+        uint sl = (slot0 + i) & RC_MASK;
+        uint prev = atomicCompSwap(rcKeys[sl].x, 0u, check);
+        if (prev == 0u || prev == check) return int(sl);
+    }
+    return -1;
+}
+
+uint gRayStat[20] = uint[20](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+#ifdef PT_PROFILE
+uint64_t gProf[22] = uint64_t[22](0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul, 0ul);
+uint64_t gLap = 0ul;
+#define PROF_START() if (p.glassParams.w > 1.5) { gLap = clockARB(); gProf[0] = gLap; }
+#define PROF_LAP(i) if (p.glassParams.w > 1.5) { uint64_t tNow = clockARB(); gProf[i] += tNow - gLap; gLap = tNow; }
+#define PROF_FINISH() if (p.glassParams.w > 1.5) { gProf[0] = clockARB() - gProf[0]; }
+#else
+#define PROF_START()
+#define PROF_LAP(i)
+#define PROF_FINISH()
+#endif
+void flushRayStats() {
+    if (p.glassParams.w < 0.5) return;
+    // [[unroll]]
+    [[unroll]] for (int i = 0; i < 16; ++i) {
+        uint sum = subgroupAdd(i == 10 ? (gRayStat[i] + 4u) >> 3 : gRayStat[i]);
+        if (subgroupElect() && sum != 0u) atomicAdd(rayStats[i], sum);
+    }
+    [[unroll]] for (int i = 16; i < 20; ++i) {
+        uint sum = subgroupAdd(gRayStat[i]);
+        if (subgroupElect() && sum != 0u) atomicAdd(rayStats[44 + i], sum);
+    }
+#ifdef PT_PROFILE
+    [[unroll]] for (int i = 0; i < 22; ++i) {
+        uint lane = uint(min(gProf[i] >> 6ul, uint64_t(0x7FFFFFu)));  // 64-cycle units
+        uint warpAvg = subgroupAdd(lane) / gl_SubgroupSize;
+        if (subgroupElect() && warpAvg != 0u) {
+            uint old = atomicAdd(rayStats[16 + 2 * i], warpAvg);
+            if (old + warpAvg < old) atomicAdd(rayStats[17 + 2 * i], 1u);  // carry into the high word
+        }
+    }
+#endif
+}
+
+vec3 traceShadowRayTinted(vec3 origin, vec3 dir, float maxDist) {
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsTerminateOnFirstHitEXT,
+                          RAYMASK_WORLD, origin, 0.0015, dir, maxDist);
+    vec3 transmission = vec3(1.0);
+    uint glassHits = 0u;
+    uint glassVolumeFaces = 0u;
+    vec3 lastGlassHalfTint = vec3(1.0);
+    float waterSurfaceT = maxDist;  // nearest water surface crossed (path-traced water)
+    bool causticHandoff = false;  // crossed water inside the photon window (applied once, after the loop)
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue; if (waterPatchHides(rq)) continue;  // displaced water patch
+        bool alphaTestPassed;
+        // `candidateEntry` is the same MaterialEntry this call already fetched internally
+        MaterialEntry candidateEntry;
+        if (resolveAlphaTestCandidate(rq, alphaTestPassed, candidateEntry)) {
+            if (gShadeGrass && gCandidateIsGrass) continue;  // grass doesn't shadow grass, see gShadeGrass
+            if (alphaTestPassed) rayQueryConfirmIntersectionEXT(rq);
+            continue;
+        }
+        bool resolved = false;
+        vec3 tint = vec3(1.0);
+        float opacity = 1.0;
+        {
+            MaterialEntry m = candidateEntry;
+            if (m.vertexAddr != 0ul && m.indexAddr != 0ul) {
+                // rayQueryGetIntersectionPrimitiveIndexEXT is 0-based within this geometry
+                // (geometryIndex==1), i.e
+                int localPrimId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, false);
+                uint primId = uint(localPrimId) + uint(m.albedoPad.w) / 3u;
+                VertexBuf vb = VertexBuf(m.vertexAddr);
+                IndexBuf ib = IndexBuf(m.indexAddr);
+                uint i0 = ib.i[primId * 3 + 0];
+                uint i1 = ib.i[primId * 3 + 1];
+                uint i2 = ib.i[primId * 3 + 2];
+                MaterialInfo mat = fetchMaterialInfo(vb.v[i0].materialIndex);
+                if ((mat.flags & MATFLAG_LAVA) != 0u) { rayQueryConfirmIntersectionEXT(rq); break; }  // lava (flat tops / displaced patch) is solid
+                if (gShadowWaterCaustic > 0.0 && (mat.flags & MATFLAG_WATER) != 0u) {  // this light arrives as photons
+                    if (gShadowWaterCaustic >= 0.999) { rayQueryConfirmIntersectionEXT(rq); break; }
+                    // once per ray, not per water candidate
+                    causticHandoff = true;
+                }
+                vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+                vec3 bary = vec3(1.0 - bc.x - bc.y, bc.x, bc.y);
+                vec2 uv = vb.v[i0].uv * bary.x + vb.v[i1].uv * bary.y + vb.v[i2].uv * bary.z;
+                vec3 diffuseSample;
+                uint shadowTexIndex = (mat.diffuseTexIndex != 0u) ? mat.diffuseTexIndex : vb.v[i0].textureIndex;
+                bool glassVolume = (mat.flags & MATFLAG_WATER) == 0u && shadowTexIndex == 0u;
+                if (glassVolume) {
+                    // one face of a glass volume, entry and exit each take half the tint (sqrt),
+                    // nearly lossless
+                    lastGlassHalfTint = sqrt(glassVolumeTint(mat.colorscale.xyz));
+                    transmission *= lastGlassHalfTint * 0.96;
+                    ++glassVolumeFaces;
+                    if (++glassHits >= MAX_GLASS_SHADOW_HITS * 2u) { rayQueryConfirmIntersectionEXT(rq); break; }
+                    continue;
+                }
+                if ((mat.flags & MATFLAG_WATER) != 0u) {
+                    diffuseSample = mat.colorscale.xyz;
+                    waterSurfaceT = min(waterSurfaceT, rayQueryGetIntersectionTEXT(rq, false));
+                } else {
+                    uint texIndex = (mat.diffuseTexIndex != 0u) ? mat.diffuseTexIndex : vb.v[i0].textureIndex;
+                    // explicit LOD, not texture()
+                    diffuseSample = pow(textureLod(uMapTextures[nonuniformEXT(texIndex)], uv, 0.0).rgb, vec3(2.2)) * mat.colorscale.xyz;
+                }
+                opacity = clamp(mat.glowcolor.w, 0.0, 1.0);
+                // A more opaque pane both tints more strongly toward its diffuse color and blocks more
+                // light overall
+                if ((mat.flags & MATFLAG_WATER) == 0u) diffuseSample = mix(vec3(1.0), diffuseSample, clamp(p.glassParams.y, 0.0, 1.0));  // alpha-geometry glass tint strength
+                tint = mix(vec3(1.0), diffuseSample, opacity);
+                resolved = true;
+            }
+        }
+        if (!resolved) {
+            rayQueryConfirmIntersectionEXT(rq);
+            continue;
+        }
+        transmission *= tint * (1.0 - opacity * 0.7);
+        if (++glassHits >= MAX_GLASS_SHADOW_HITS || dot(transmission, transmission) < 1e-6) {
+            rayQueryConfirmIntersectionEXT(rq);
+            break;
+        }
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) != gl_RayQueryCommittedIntersectionNoneEXT) return vec3(0.0);
+    if ((glassVolumeFaces & 1u) != 0u) transmission *= lastGlassHalfTint;
+    if (causticHandoff) transmission *= 1.0 - gShadowWaterCaustic;
+    if (any(greaterThan(gShadowWaterSigma, vec3(0.0))))
+        transmission *= exp(-gShadowWaterSigma * min(waterSurfaceT, waterPlaneT(origin, dir, gShadowWaterSurfaceZ)));
+    return transmission;
+}
+
+const bool RAYCONE_LOD_ENABLED = true;
+
+float computeRayConeLodBase(vec3 p0, vec3 p1, vec3 p2, vec2 uv0, vec2 uv1, vec2 uv2,
+                             float coneWidth, float cosTheta) {
+    float worldArea = length(cross(p1 - p0, p2 - p0));
+    vec2 uv10 = uv1 - uv0, uv20 = uv2 - uv0;
+    float uvArea = abs(uv10.x * uv20.y - uv10.y * uv20.x);
+    if (worldArea < 1e-9 || uvArea < 1e-12) return -100.0;
+    return 0.5 * log2(uvArea / worldArea) + log2(max(coneWidth, 1e-6)) - log2(max(abs(cosTheta), 1e-4));
+}
+
+float computeRayConeLodForTexture(float lodBase, ivec2 texSize) {
+    if (!RAYCONE_LOD_ENABLED) return 0.0;
+    float lambda = lodBase + 0.5 * log2(float(texSize.x) * float(texSize.y));
+    return clamp(lambda, 0.0, floor(log2(float(max(texSize.x, texSize.y)))));
+}
+
+vec3 applyNormalMap(vec3 N, vec4 tangent, vec2 uv, uint normalTexIndex, float lod) {
+    vec3 T = tangent.xyz - N * dot(tangent.xyz, N);
+    float tlen = length(T);
+    if (tlen < 1e-6) return N;
+    T /= tlen;
+    vec3 B = cross(N, T) * (tangent.w >= 0.0 ? 1.0 : -1.0);
+    // MIPMAPPING for lod
+    vec3 tsNormal = (gUseGrad ? textureGrad(uMapTextures[nonuniformEXT(normalTexIndex)], uv, gUvDx, gUvDy)
+                              : textureLod(uMapTextures[nonuniformEXT(normalTexIndex)], uv, lod)).rgb * 2.0 - 1.0;
+    return normalize(mat3(T, B, N) * tsNormal);
+}
+
+vec3 faceViewer(vec3 n, vec3 dir) {
+    const float MIN_NV = 0.05;
+    float nv = -dot(n, dir);
+    return nv >= MIN_NV ? n : normalize(n - dir * (MIN_NV - nv));
+}
+
+// ============================================================ Direct lighting (NEE) helpers
+
+uint sampleEmissiveIndexImportance(inout uint seed, uint count) {
+    float u = randFloat(seed);
+    uint lo = 0u, hi = count - 1u;
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (emissiveTriangles[mid].v2.w < u) lo = mid + 1u; else hi = mid;
+    }
+    return lo;
+}
+
+// samples one point on one triangle chosen by power-weighted importance instead of uniformly
+#include "rt_lava.glsl"
+const vec3 LAVA_NOMINAL = vec3(1.2, 0.25, 0.01);  // = WaterExtract.h kLavaNominal (light-selection weight per unit glow)
+LavaSurfaceInfo lavaSurfaceP(vec3 pos, vec3 n, float glow) {
+    LavaSurfaceInfo ls = lavaSurfaceS(pos, n, glow, p.lava0, p.lava1, lavaShoreFromMap(uWaveMap, p.waterMap, pos.xy));
+    ls.emission = lavaTint(ls.emission, p.lavaPatch.zw);  // lava colour (lavacolour)
+    return ls;
+}
+
+bool sampleEmissiveTriangle(inout uint seed, uint count, out vec3 pointOnTri, out vec3 triNormal,
+                             out float area, out vec3 radiance, out float lumUnscaled) {
+    uint idx = sampleEmissiveIndexImportance(seed, count);
+    EmissiveTriangle t = emissiveTriangles[idx];
+    vec3 v0 = t.v0.xyz, v1 = t.v1.xyz, v2 = t.v2.xyz;
+    float r1 = randFloat(seed);
+    float r2 = randFloat(seed);
+    float su0 = sqrt(r1);
+    float b0 = 1.0 - su0;
+    float b1 = r2 * su0;
+    float b2 = 1.0 - b0 - b1;
+    pointOnTri = b0 * v0 + b1 * v1 + b2 * v2;
+    vec3 edge1 = v1 - v0, edge2 = v2 - v0;
+    vec3 cr = cross(edge1, edge2);
+    float len = length(cr);
+    area = 0.5 * len;
+    triNormal = len > 1e-8 ? cr / len : vec3(0.0, 0.0, 1.0);
+    lumUnscaled = luminance(t.radiance.xyz);
+    radiance = t.radiance.xyz * p.ambientFloorPad.w;
+    if (t.radiance.w > 0.5)
+        radiance = lavaSurfaceP(pointOnTri, triNormal, t.radiance.x / LAVA_NOMINAL.x).emission * p.ambientFloorPad.w;
+    return area > 1e-8;
+}
+
+bool gPomApply = false;  // set only around the primary hit's attribute fetch
+float gHitEnvRefl = 0.0;
+float gHitRoughOverride = -1.0;
+float gHitSpecWeight = 1.0;  // a surface's own specular scale (rough basalt crust barely shines)
+// the last fetched hit's emission came from a model's glow mask (mdlptemissive)
+bool gHitModelEmission = false;
+float gHitLavaGlow = 0.0;
+// true while shading a glowing model's surface, see accumulatePointLight()
+bool gShadeSelfEmitter = false;
+bool gHitIsDynamic = false;
+bool gPomHit = false;  // primary hit used POM, context below is valid
+vec2 gPomUv;
+vec3 gPomT, gPomB, gPomN;
+uint gPomTex;
+float gPomScale;
+
+float pomHeight(uint tex, vec2 uv) {
+    return textureLod(uMapTextures[nonuniformEXT(tex)], uv, 0.0).a;
+}
+
+vec2 pomTexcoord(vec2 uv0, vec3 viewTs, uint tex, float scale, float bias) {
+    float neutral = clamp(-bias / max(scale, 1e-6), 0.0, 1.0);
+    float vz = max(viewTs.z, 0.05);
+    vec2 uvPerDepth = -viewTs.xy / vz * scale;  // uv change per unit of depth, going into the surface
+    float maxSteps = max(p.pomParams.y, 4.0);
+    float numLayers = mix(maxSteps, maxSteps * 0.25, clamp(viewTs.z, 0.0, 1.0));  // more steps at grazing angles
+    float layer = 1.0 / numLayers;
+    vec2 uv = uv0 - uvPerDepth * (1.0 - neutral);  // top of the height field (depth 0)
+    float depth = 0.0;
+    float hDepth = 1.0 - pomHeight(tex, uv);
+    vec2 prevUv = uv;
+    float prevDepth = 0.0, prevHDepth = hDepth;
+    int limit = int(numLayers) + 2;
+    for (int i = 0; i < limit && depth < hDepth; ++i) {
+        prevUv = uv; prevDepth = depth; prevHDepth = hDepth;
+        uv += uvPerDepth * layer;
+        depth += layer;
+        hDepth = 1.0 - pomHeight(tex, uv);
+    }
+    // interpolate between the last two samples (reduces stair-stepping)
+    float above = prevHDepth - prevDepth;
+    float below = hDepth - depth;
+    float w = clamp(above / max(above - below, 1e-6), 0.0, 1.0);
+    vec2 result = mix(prevUv, uv, w);
+    return any(isnan(result)) ? uv0 : result;
+}
+
+// QuadtreePOM (Remix's second variant)
+vec2 pomTexcoordQuadtree(vec2 uv0, vec3 viewTs, uint htex, uint ntex, float scale, float bias) {
+    float neutral = clamp(-bias / max(scale, 1e-6), 0.0, 1.0);
+    float vz = max(viewTs.z, 0.05);
+    vec2 dUV = -viewTs.xy / vz * scale;  // uv per unit of depth (depth 0 = top of the field)
+    vec2 uvTop = uv0 - dUV * (1.0 - neutral);
+    ivec2 size0 = textureSize(uMapTextures[nonuniformEXT(htex)], 0);
+    int maxLevel = textureQueryLevels(uMapTextures[nonuniformEXT(htex)]) - 1;
+    int level = maxLevel;
+    float t = 0.0;
+    int maxIter = int(max(p.pomParams.y, 4.0)) * 2;
+    for (int i = 0; i < maxIter && level >= 0 && t < 1.0; ++i) {
+        ivec2 sz = max(size0 >> level, ivec2(1));
+        vec2 szf = vec2(sz);
+        vec2 pT = (uvTop + dUV * t) * szf;  // position in this level's texel space
+        vec2 cell = floor(pT);
+        ivec2 ci = ivec2(cell - szf * floor(cell / szf));  // wrap (repeat)
+        float tSurf = 1.0 - texelFetch(uMapTextures[nonuniformEXT(htex)], ci, level).r;
+        if (t >= tSurf) { --level; continue; }  // at/below this cell's highest point, refine
+        vec2 d = dUV * szf;
+        float tx = d.x > 1e-7 ? (cell.x + 1.0 - pT.x) / d.x : (d.x < -1e-7 ? (cell.x - pT.x) / d.x : 1e9);
+        float ty = d.y > 1e-7 ? (cell.y + 1.0 - pT.y) / d.y : (d.y < -1e-7 ? (cell.y - pT.y) / d.y : 1e9);
+        float tExit = t + min(tx, ty);
+        if (tSurf <= tExit) { t = tSurf; --level; }
+        else {
+            t = tExit + 1e-3 / max(max(abs(d.x), abs(d.y)), 1e-3);
+            level = min(level + 1, maxLevel);
+        }
+    }
+    t = clamp(t, 0.0, 1.0);
+
+    // bilinear refine
+    vec2 d0 = dUV * vec2(size0);
+    float window = min(1.5 / max(max(abs(d0.x), abs(d0.y)), 1e-3), 1.0);
+    float tA = max(t - window, 0.0), tB = min(t + window * 0.5, 1.0);
+    const int REFINE = 12;
+    float stepT = (tB - tA) / float(REFINE);
+    float prevT = tA;
+    float prevDiff = (1.0 - pomHeight(ntex, uvTop + dUV * tA)) - tA;
+    if (prevDiff <= 0.0) return uvTop + dUV * tA;
+    for (int i = 1; i <= REFINE; ++i) {
+        float ti = tA + stepT * float(i);
+        float diff = (1.0 - pomHeight(ntex, uvTop + dUV * ti)) - ti;
+        if (diff <= 0.0) {
+            float w = clamp(prevDiff / max(prevDiff - diff, 1e-6), 0.0, 1.0);
+            vec2 r = uvTop + dUV * mix(prevT, ti, w);
+            return any(isnan(r)) ? uv0 : r;
+        }
+        prevT = ti; prevDiff = diff;
+    }
+    vec2 r = uvTop + dUV * t;
+    return any(isnan(r)) ? uv0 : r;
+}
+
+float pomVisibility(vec2 uv, vec3 lightTs, uint tex, float scale) {
+    if (lightTs.z <= 0.0) return 1.0;
+    float maxSteps = max(p.pomParams.y, 4.0);
+    float numLayers = mix(maxSteps, maxSteps * 0.25, clamp(lightTs.z, 0.0, 1.0));
+    float layer = 1.0 / numLayers;
+    vec2 step = lightTs.xy / max(lightTs.z, 0.05) * scale * layer;  // toward the light = out of the surface
+    float depth = 1.0 - pomHeight(tex, uv);
+    float vis = 1.0;
+    int limit = int(numLayers) + 2;
+    for (int i = 0; i < limit && depth > 0.0 && vis > 0.0; ++i) {
+        uv += step;
+        depth -= layer;
+        float hDepth = 1.0 - pomHeight(tex, uv);
+        if (hDepth < depth) vis -= (depth - hDepth) / layer;
+    }
+    return clamp(vis, 0.0, 1.0);
+}
+
+// height-field visibility of direction dir (world) from the primary POM point
+float pomDirVisibility(vec3 dir) {
+    if (!gPomHit || gBounce != 0u) return 1.0;
+    vec3 ts = vec3(dot(dir, gPomT), dot(dir, gPomB), dot(dir, gPomN));
+    return pomVisibility(gPomUv, ts, gPomTex, gPomScale);
+}
+
+float fresnelDielectric(float cosI, float iorFrom, float iorTo) {
+    float eta = iorFrom / iorTo;
+    float sin2T = eta * eta * max(0.0, 1.0 - cosI * cosI);
+    if (sin2T >= 1.0) return 1.0;
+    float cosT = sqrt(max(0.0, 1.0 - sin2T));
+    float rs = (iorFrom * cosI - iorTo * cosT) / max(iorFrom * cosI + iorTo * cosT, 1e-6);
+    float rp = (iorTo * cosI - iorFrom * cosT) / max(iorTo * cosI + iorFrom * cosT, 1e-6);
+    return clamp(0.5 * (rs * rs + rp * rp), 0.0, 1.0);
+}
+
+const float CAUSTIC_NEAR = 16.0;
+const uint CAUSTIC_LEVELS = 12u;
+const float CAUSTIC_KERNEL_PHOTONS = 24.0;  // photons a gather kernel should hold (all batches)
+vec2 causticCamXY() { return (p.invView * vec4(0.0, 0.0, 0.0, 1.0)).xy; }
+float causticRange() { return max(p.causticParams.w, 8.0); }
+// photons are emitted over a wider disc than the window they light
+float causticEmitRange() { float R = causticRange(); return R + max(32.0, 0.5 * R); }
+float causticLnK() { float R = causticEmitRange(); return log(1.0 + R * R / (CAUSTIC_NEAR * CAUSTIC_NEAR)); }
+uint causticPerBatch() { uint G = uint(sqrt(max(p.causticParams.z, 0.0))); return G * G; }
+// hash heads per batch
+uint causticHashSize() { uint n = max(2u * causticPerBatch(), 1u << 19); return 1u << uint(findMSB(n - 1u) + 1); }
+// emission pdf per unit area, at horizontal distance r from the camera (normalised over the emission
+// disc)
+float causticAreaPdf(float r) { return 1.0 / (PI * causticLnK() * (CAUSTIC_NEAR * CAUSTIC_NEAR + r * r)); }
+float causticRadiusAt(float r) {
+    float batches = float(CAUSTIC_BATCHES);
+    float density = batches * float(causticPerBatch()) * causticAreaPdf(r);
+    // the sharpest radius
+    float sharpest = max(p.causticParams.y, 0.05) * min(1.0, sqrt(131044.0 / max(float(causticPerBatch()), 1.0)));
+    return clamp(sqrt(CAUSTIC_KERNEL_PHOTONS / (PI * max(density, 1e-12))), max(sharpest, 0.03), 32.0);
+}
+float causticLevelF(float r) { return log2(max(r, CAUSTIC_NEAR) / CAUSTIC_NEAR); }
+// a photon goes into the level nearest its distance
+uint causticLevelOf(float r) { return min(uint(floor(causticLevelF(r) + 0.5)), CAUSTIC_LEVELS - 1u); }
+float causticCellSizeL(uint L) { return 2.0 * causticRadiusAt(CAUSTIC_NEAR * exp2(float(L) + 0.5)); }
+uint causticHashL(ivec3 c, uint L) { return (uint(c.x) * 73856093u ^ uint(c.y) * 19349663u ^ uint(c.z) * 83492791u ^ L * 2654435761u) & (causticHashSize() - 1u); }
+uint causticKeyL(ivec3 c, uint L) { return pcgHash(uint(c.x) ^ pcgHash(uint(c.y) ^ pcgHash(uint(c.z) + 0x9E3779B9u + L * 0x85EBCA6Bu))) | 1u; }
+// the photon window (a disc of radius R around the camera)
+float causticWindowWeight(vec3 x) {
+    if (p.causticParams.x < 0.5) return 0.0;
+    float R = causticRange();
+    return 1.0 - smoothstep(0.75 * R, 0.95 * R, length(x.xy - causticCamXY()));
+}
+bool causticWaterCandidate(rayQueryEXT rq) {
+    int id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+    if (id < 0 || id >= materials.length()) return false;
+    MaterialEntry m = materials[id];
+    if (m.vertexAddr == 0ul || m.indexAddr == 0ul) return false;
+    uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false)) + uint(m.albedoPad.w) / 3u;
+    VertexBuf vb = VertexBuf(m.vertexAddr);
+    IndexBuf ib = IndexBuf(m.indexAddr);
+    return (fetchMaterialInfo(vb.v[ib.i[prim * 3u]].materialIndex).flags & MATFLAG_WATER) != 0u;
+}
+
+// caustic irradiance at x (directLighting() units)
+vec3 gatherCaustics(vec3 x, vec3 N) {
+    uint validMask = uint(p.causticParams2.y);
+    uint validCount = bitCount(validMask);
+    if (validCount == 0u) return vec3(0.0);
+    float rd = length(x.xy - causticCamXY());
+    float r = causticRadiusAt(rd);
+    float r2 = r * r;
+    uint L0 = min(uint(floor(causticLevelF(rd))), CAUSTIC_LEVELS - 1u);
+    uint L1 = min(L0 + 1u, CAUSTIC_LEVELS - 1u);
+    vec3 sum = vec3(0.0);
+    for (uint lv = 0u; lv < 2u; ++lv) {
+        uint L = lv == 0u ? L0 : L1;
+        if (lv == 1u && L1 == L0) break;
+        float cs = causticCellSizeL(L);
+        ivec3 lo = ivec3(floor((x - vec3(r)) / cs)), hi = ivec3(floor((x + vec3(r)) / cs));
+        for (uint b = 0u; b < CAUSTIC_BATCHES; ++b) {
+            if (((validMask >> b) & 1u) == 0u) continue;
+            for (int cz = lo.z; cz <= hi.z; ++cz)
+            for (int cy = lo.y; cy <= hi.y; ++cy)
+            for (int cx = lo.x; cx <= hi.x; ++cx) {
+                ivec3 c = ivec3(cx, cy, cz);
+                uint key = causticKeyL(c, L);
+                uint idx = causticHeads[b * causticHashSize() + causticHashL(c, L)];
+                for (int guard = 0; idx != 0xFFFFFFFFu && guard < 512; ++guard) {
+                    CausticPhoton ph = causticPhotons[idx];
+                    if (floatBitsToUint(ph.powerKey.w) == key) {
+                        vec3 d = ph.posNext.xyz - x;
+                        float d2 = dot(d, d);
+                        if (d2 < r2 && dot(ph.normal.xyz, N) > 0.5 && abs(dot(d, N)) < 0.5 * r)
+                            sum += ph.powerKey.xyz * (1.0 - d2 / r2);
+                    }
+                    idx = floatBitsToUint(ph.posNext.w);
+                }
+            }
+        }
+    }
+    // each batch alone is a full estimate (its photons carry flux / N)
+    return sum * (2.0 / (PI * r2)) / float(validCount);
+}
+
+// unshadowed flux weight of point light li onto a glass point g (normal ng)
+float causticLightWeight(uint li, vec3 g, vec3 ng) {
+    vec3 tl = lightNearestPoint(lights[li].posRadius.xyz, lightHalfAxis(lights[li].colorFlags, lights[li].reserved), g) - g;
+    float d = length(tl);
+    if (d < 1e-3) return 0.0;
+    int fb = int(lights[li].colorFlags.w + 0.5);
+    bool nf = (fb & 2) != 0;
+    float radius = lights[li].posRadius.w;
+    if (!nf && d >= radius) return 0.0;
+    float atten = nf ? 1.0 : 1.0 - d / radius;
+    return luminance(lights[li].colorFlags.xyz) * atten * abs(dot(ng, tl / d));
+}
+
+// binding 26, see rt_lightgrid.glsl
+#define LIGHTGRID_BINDING 26
+#include "rt_lightgrid.glsl"
+
+float pointLightPickWeight(uint li, vec3 pos, vec3 N) {
+    vec3 halfAxis = lightHalfAxis(lights[li].colorFlags, lights[li].reserved);
+    vec3 toLight = lightNearestPoint(lights[li].posRadius.xyz, halfAxis, pos) - pos;  // reach from the segment's nearest point
+    float dist = length(toLight);
+    if (dist < 1e-4 || (gShadeSelfEmitter && lightShadowGap(lights[li].colorFlags, lights[li].reserved) > 0.0)) return 0.0;  // a glowing model isn't lit by emitter lights (its own glow)
+    float radius = lights[li].posRadius.w;
+    bool noFalloff = (int(lights[li].colorFlags.w + 0.5) & 2) != 0;
+    if (!noFalloff && dist >= radius) return 0.0;
+    float NdotL = lightWeighCosine(lights[li].posRadius.xyz, halfAxis, pos, N, toLight / dist);
+    if (NdotL <= 0.0) return 0.0;
+    float atten = (noFalloff ? 1.0 : (1.0 - dist / radius)) * lightFacing(li, -toLight / dist);
+    return luminance(lights[li].colorFlags.xyz) * atten * NdotL;
+}
+
+float pointLightSplitWeight(uint li, vec3 pos, vec3 N, vec3 V, vec3 albedo, vec3 F0, float roughness, float metalness) {
+    vec3 halfAxis = lightHalfAxis(lights[li].colorFlags, lights[li].reserved);
+    vec3 toLight = lightNearestPoint(lights[li].posRadius.xyz, halfAxis, pos) - pos;  // reach from the segment's nearest point
+    float dist = length(toLight);
+    if (dist < 1e-4 || (gShadeSelfEmitter && lightShadowGap(lights[li].colorFlags, lights[li].reserved) > 0.0)) return 0.0;  // a glowing model isn't lit by emitter lights (its own glow)
+    float radius = lights[li].posRadius.w;
+    bool noFalloff = (int(lights[li].colorFlags.w + 0.5) & 2) != 0;
+    if (!noFalloff && dist >= radius) return 0.0;
+    vec3 L = toLight / dist;
+    float NdotL = lightWeighCosine(lights[li].posRadius.xyz, halfAxis, pos, N, L);
+    if (NdotL <= 0.0) return 0.0;
+    float atten = (noFalloff ? 1.0 : (1.0 - dist / radius)) * lightFacing(li, -L);
+    float pdfUnused;
+    vec3 f = evalBsdf(N, V, L, albedo, F0, roughness, metalness, pdfUnused);
+    return luminance(f * lights[li].colorFlags.xyz) * atten * NdotL + 1e-12;
+}
+
+bool gLastLightVisible = false;  // did the last accumulatePointLight()'s shadow ray reach its light
+void accumulatePointLight(uint li, float scale, vec3 pos, vec3 N, vec3 V, vec3 albedo, vec3 F0, float roughness, float metalness,
+                          inout vec3 result, inout vec3 staticDirect, inout vec3 lmIrradiance) {
+    gLastLightVisible = false;
+    // the reach is measured from the segment's nearest point
+    vec3 halfAxis = lightHalfAxis(lights[li].colorFlags, lights[li].reserved);
+    vec3 lightPos = lightNearestPoint(lights[li].posRadius.xyz, halfAxis, pos);
+    float radius = lights[li].posRadius.w;
+    vec3 toLight = lightPos - pos;
+    float dist = length(toLight);
+    // a glowing model sits inside its light's shadow gap
+    if (dist < 1e-4 || (gShadeSelfEmitter && lightShadowGap(lights[li].colorFlags, lights[li].reserved) > 0.0)) return;
+    // flag bits
+    int flagBits = int(lights[li].colorFlags.w + 0.5);
+    bool isDynlight = (flagBits & 1) != 0;
+    bool noFalloff = (flagBits & 2) != 0;
+    if (!noFalloff && dist >= radius) return;
+    gRayStat[8]++;
+    vec3 lightDir = toLight / dist;
+    if (lightWeighCosine(lights[li].posRadius.xyz, halfAxis, pos, N, lightDir) <= 0.0) return;
+    float atten = (noFalloff ? 1.0 : (1.0 - dist / radius)) * lightFacing(li, -lightDir);
+
+    // soft (penumbra) shadows
+    float lightSize = lightSourceRadius(lights[li].posRadius, lights[li].colorFlags, lights[li].reserved);
+    if (dot(halfAxis, halfAxis) > 1e-8) {
+        // a capsule
+        lightPos = lights[li].posRadius.xyz + halfAxis * (blueNoise2D(0x4000u + li).x * 2.0 - 1.0);
+        lightDir = normalize(lightPos - pos);
+    }
+    vec3 lightTangent, lightBitangent;
+    buildBasis(lightDir, lightTangent, lightBitangent);
+    vec2 diskUv = blueNoise2D(8u + li);
+    float diskR = lightSize * sqrt(diskUv.x);
+    float diskTheta = 6.28318530718 * diskUv.y;
+    vec3 jitteredLightPos = lightPos + lightTangent * (diskR * cos(diskTheta)) + lightBitangent * (diskR * sin(diskTheta));
+    vec3 jitteredToLight = jitteredLightPos - pos;
+    float jitteredDist = length(jitteredToLight);
+    if (jitteredDist < 1e-4) return;
+    lightDir = jitteredToLight / jitteredDist;
+    if (dot(N, lightDir) <= 0.0) return;
+
+    vec3 origin = pos + N * 0.02;
+    if (gBounce == 0u) gRayStat[3]++; else gRayStat[4]++;  // constant indices, see flushRayStats()
+    // reserved.x = the light's shadow gap
+    const bool perfSkipShadow = gBounce == 0u && ((uint(p.causticParams2.w) >> 22) & 1u) != 0u;
+    vec3 shadowTint = perfSkipShadow ? vec3(1.0) : traceShadowRayTinted(origin, lightDir, jitteredDist - max(lightShadowGap(lights[li].colorFlags, lights[li].reserved), 0.04)) * pomDirVisibility(lightDir);
+    gLastLightVisible = dot(shadowTint, shadowTint) > 0.0;
+    if (dot(shadowTint, shadowTint) > 0.0) {
+        float pdfUnused;
+        vec3 f = evalBsdf(N, V, lightDir, albedo, F0, roughness, metalness, pdfUnused);
+        // SAUER_LIGHTMAP_OVERBRIGHT and SAUER_BRDF_PI_COMPENSATION
+        float overbright = SAUER_LIGHTMAP_OVERBRIGHT * SAUER_BRDF_PI_COMPENSATION;
+        vec3 lightTerm = f * dot(N, lightDir) * lights[li].colorFlags.xyz * shadowTint * overbright * atten * scale;
+        if (isDynlight) result += lightTerm;
+        else {
+            staticDirect += lightTerm;
+            lmIrradiance += dot(N, lightDir) * lights[li].colorFlags.xyz * shadowTint * atten * scale;
+        }
+    }
+}
+
+// skybox light (ptsky) the sky lights the scene with the skybox itself
+const uint SKY_W = 64u, SKY_H = 32u, SKY_CELLS = SKY_W * SKY_H;  // keep in sync with RayTracingScene::kSkyCdfCells
+layout(std430, set = 0, binding = 30) buffer SkyCdfBuf {
+    vec4 skyHeader;
+    float skyCdf[];  // inclusive, normalized cumulative cell probability
+};
+vec3 sampleRealSky(vec3 dir);
+// sky-local (the skybox texture's frame) <-> world
+vec3 skyLocalToWorld(vec3 d) { float c = cos(p.skyRotationPad.x), s = sin(p.skyRotationPad.x); return vec3(d.x * c - d.y * s, d.x * s + d.y * c, d.z); }
+vec3 skyWorldToLocal(vec3 d) { float c = cos(p.skyRotationPad.x), s = sin(p.skyRotationPad.x); return vec3(d.x * c + d.y * s, -d.x * s + d.y * c, d.z); }
+vec3 skyUvToDir(vec2 uv) {
+    float phi = 6.28318530718 * uv.x, z = 1.0 - 2.0 * uv.y, r = sqrt(max(0.0, 1.0 - z * z));
+    return vec3(r * cos(phi), r * sin(phi), z);
+}
+uint skyDirToCell(vec3 d) {
+    float phi = atan(d.y, d.x); if (phi < 0.0) phi += 6.28318530718;
+    uint x = min(uint(phi / 6.28318530718 * float(SKY_W)), SKY_W - 1u);
+    uint y = min(uint((1.0 - clamp(d.z, -1.0, 1.0)) * 0.5 * float(SKY_H)), SKY_H - 1u);
+    return y * SKY_W + x;
+}
+bool skyLightActive() { return p.skyParams.x > 0.5 && skyHeader.w > 0.5; }
+// radiance the sky lights the scene with along world direction `dir`
+vec3 skyLightRadianceSkybox(vec3 dir) { return sampleRealSky(dir) * skyHeader.x; }
+// solid-angle pdf of skySampleDirection() producing world direction `dir`
+float skyPdf(vec3 dir) {
+    uint c = skyDirToCell(skyWorldToLocal(dir));
+    float prob = skyCdf[c] - (c > 0u ? skyCdf[c - 1u] : 0.0);
+    return max(prob, 0.0) * skyHeader.y;
+}
+vec3 skySampleDirection(inout uint seed, out float pdf) {
+    float u = randFloat(seed);
+    uint lo = 0u, hi = SKY_CELLS - 1u;  // first cell whose cdf exceeds u
+    while (lo < hi) { uint mid = (lo + hi) >> 1; if (skyCdf[mid] > u) hi = mid; else lo = mid + 1u; }
+    float prob = skyCdf[lo] - (lo > 0u ? skyCdf[lo - 1u] : 0.0);
+    pdf = max(prob, 0.0) * skyHeader.y;
+    vec2 uv = (vec2(float(lo % SKY_W), float(lo / SKY_W)) + vec2(randFloat(seed), randFloat(seed))) / vec2(float(SKY_W), float(SKY_H));
+    return skyLocalToWorld(skyUvToDir(uv));
+}
+// true while shading a vertex no BSDF ray will continue from (the path's last bounce, a water-
+// reflection hit)
+bool gNoContinuation = false;
+
+uint perfCutValue() { return (uint(p.causticParams2.w) >> 19) & 7u; }
+#define PERF_CUT_DL(v) if (gBounce == 0u && perfCutValue() == (v)) { lmIrrOut = min(lmIrradiance, vec3(1.0)); return result + staticDirect; }
+layout(std430, set = 0, binding = 33) buffer RestirBuf { uvec4 restirRes[]; };
+const float RESTIR_MCAP = 20.0;
+
+struct RestirReservoir { uint light; float wSum; float M; float pHat; };
+
+void restirAdd(inout RestirReservoir r, uint li, float w, float pHat, float M, inout uint seed) {
+    r.M += M;
+    if (w <= 0.0) return;
+    r.wSum += w;
+    if (randFloat(seed) * r.wSum < w) { r.light = li; r.pHat = pHat; }
+}
+
+// merges last frame's reservoir at `src` into r when it was the same surface
+void restirReuse(inout RestirReservoir r, uint src, vec3 pos, vec3 N, vec3 V, vec3 albedo, vec3 F0, float roughness, float metalness,
+                 float depth, float mCap, uint lightCount, inout uint seed) {
+    uvec4 q = restirRes[src];
+    if (q.x == 0xFFFFFFFFu || q.x >= lightCount) return;
+    vec2 md = unpackHalf2x16(q.z);
+    vec3 qN = unpackSnorm4x8(q.w).xyz;
+    if (dot(qN, N) < 0.9 || abs(md.y - depth) > 0.1 * depth + 0.5) return;
+    float qW = uintBitsToFloat(q.y);
+    float qM = min(md.x, mCap);
+    float pHat = pointLightSplitWeight(q.x, pos, N, V, albedo, F0, roughness, metalness);
+    restirAdd(r, q.x, pHat * qW * qM, pHat, qM, seed);
+}
+
+void restirDirect(LightList lightList, uint lightCount, vec3 pos, vec3 N, vec3 V, vec3 albedo, vec3 F0, float roughness, float metalness,
+                  inout uint seed, inout vec3 result, inout vec3 staticDirect, inout vec3 lmIrradiance) {
+    const uint staticSize = lightList.cellCount + lightList.globalCount;
+    const uint Mc = clamp(uint(p.rrParams.w + 0.5), 1u, 32u);
+    const bool importance = ((uint(p.causticParams2.w) >> 23) & 1u) != 0u && lightListHasImportance(lightList);
+    RestirReservoir r = RestirReservoir(0xFFFFFFFFu, 0.0, 0.0, 0.0);
+    // new candidates, the same draw as RIS (importance tables, else uniform)
+    for (uint m = 0u; m < Mc; ++m) {
+        float u = randFloat(seed) * float(staticSize);
+        uint slot = min(uint(u), staticSize - 1u);
+        float pSource = 1.0 / float(staticSize);
+        if (importance && u < float(lightList.cellCount)) {
+            float pdfInCell;
+            slot = lightListImportancePick(lightList, u, pdfInCell);
+            pSource = pdfInCell * float(lightList.cellCount) / float(staticSize);
+        }
+        uint li = lightListGet(lightList, slot);
+        float pHat = li < lightCount ? pointLightSplitWeight(li, pos, N, V, albedo, F0, roughness, metalness) : 0.0;
+        restirAdd(r, li, pHat / pSource, pHat, 1.0, seed);
+    }
+    ivec2 size = imageSize(uRawRadiance);
+    const uint pixelCount = uint(size.x * size.y);
+    const uint parity = p.frameData.x & 1u;
+    const uint curBase = parity * pixelCount, prevBase = (parity ^ 1u) * pixelCount;
+    vec3 camPos = (p.invView * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    float depth = length(pos - camPos);
+    if (p.frameData.z != 0u) {
+        vec4 prevClip = p.prevViewProjJittered * vec4(pos, 1.0);
+        if (prevClip.w > 1e-4) {
+            vec2 prevUv = prevClip.xy / prevClip.w * 0.5 + 0.5;
+            ivec2 prevPixel = ivec2(floor(prevUv * vec2(size)));
+            float mCap = RESTIR_MCAP * float(Mc);
+            if (all(greaterThanEqual(prevPixel, ivec2(0))) && all(lessThan(prevPixel, size))) {
+                restirReuse(r, prevBase + uint(prevPixel.y * size.x + prevPixel.x), pos, N, V, albedo, F0, roughness, metalness, depth, mCap, lightCount, seed);
+                const uint NS = min(uint(p.rrParams.z + 0.5) & 7u, 4u);
+                for (uint k = 0u; k < NS; ++k) {
+                    float a = randFloat(seed) * 6.28318530718, rad = 2.0 + randFloat(seed) * 14.0;
+                    ivec2 q = clamp(prevPixel + ivec2(round(vec2(cos(a), sin(a)) * rad)), ivec2(0), size - 1);
+                    restirReuse(r, prevBase + uint(q.y * size.x + q.x), pos, N, V, albedo, F0, roughness, metalness, depth, mCap, lightCount, seed);
+                }
+            }
+        }
+    }
+    // shade the winner with one shadow ray
+    float W = (r.light != 0xFFFFFFFFu && r.pHat > 0.0 && r.M > 0.0) ? r.wSum / (r.M * r.pHat) : 0.0;
+    bool visible = false;
+    if (W > 0.0) {
+        accumulatePointLight(r.light, W, pos, N, V, albedo, F0, roughness, metalness, result, staticDirect, lmIrradiance);
+        visible = gLastLightVisible;
+    }
+    uint idx = curBase + uint(gPixel.y * size.x + gPixel.x);
+    restirRes[idx] = uvec4(r.light, floatBitsToUint(visible ? W : 0.0),
+                           packHalf2x16(vec2(min(r.M, RESTIR_MCAP * float(Mc)), depth)), packSnorm4x8(vec4(N, 0.0)));
+}
+
+vec3 directLighting(vec3 pos, vec3 N, vec3 V, vec3 albedo, vec3 F0, float roughness, float metalness, inout uint seed, out vec3 lmIrrOut) {
+    vec3 result = vec3(0.0);
+    // Sauerbraten's lightmapper sums sun + light entities per texel as N.L * colour and clamps that
+    // sum at 255
+    vec3 staticDirect = vec3(0.0);
+    vec3 lmIrradiance = vec3(0.0);
+    gRayStat[7]++;
+    gShadowWaterCaustic = gCausticGatherHere ? causticWindowWeight(pos) : 0.0;
+
+    PROF_LAP(21);  // directLighting setup
+    PERF_CUT_DL(4u)
+    if (dot(p.sunColorPad.xyz, p.sunColorPad.xyz) > 0.0) {
+        vec3 sunDirBase = normalize(-p.sunDirectionRadius.xyz);
+        float sunAngularRadius = max(p.sunDirectionRadius.w, 1e-4);
+        vec3 sunDir = jitterSunDirection(sunDirBase, sunAngularRadius, seed);
+        if (dot(N, sunDir) > 0.0) {
+            float pdfBsdf;
+            vec3 f = evalBsdf(N, V, sunDir, albedo, F0, roughness, metalness, pdfBsdf);
+            float solidAngle = max(PI * sunAngularRadius * sunAngularRadius, 1e-8);
+            float pdfLight = 1.0 / solidAngle;
+            if (pdfLight + pdfBsdf > 1e-10) {
+                vec3 origin = pos + N * 0.02;
+                // colored/attenuated, not a plain bool
+                gRayStat[2]++;
+                vec3 shadowTint = traceShadowRayTinted(origin, sunDir, 4096.0) * pomDirVisibility(sunDir);
+                if (dot(shadowTint, shadowTint) > 0.0) {
+                    vec3 sunRadiance = p.sunColorPad.xyz / solidAngle;
+                    staticDirect += f * dot(N, sunDir) * sunRadiance * shadowTint * SAUER_LIGHTMAP_OVERBRIGHT * SAUER_BRDF_PI_COMPENSATION / (pdfLight + pdfBsdf);
+                    lmIrradiance += dot(N, sunDir) * p.sunColorPad.xyz * shadowTint * (pdfLight / (pdfLight + pdfBsdf));
+                }
+            }
+        }
+    }
+
+    PROF_LAP(17);
+    PERF_CUT_DL(5u)
+    // one importance-sampled sky direction, MIS'd against BSDF sampling
+    if (skyLightActive()) {
+        float pdfSky;
+        vec3 skyDir = skySampleDirection(seed, pdfSky);
+        float NdotL = dot(N, skyDir);
+        if (NdotL > 0.0 && pdfSky > 1e-8) {
+            float pdfBsdf;
+            vec3 f = evalBsdf(N, V, skyDir, albedo, F0, roughness, metalness, pdfBsdf);
+            if (dot(f, f) > 0.0) {
+                gRayStat[2]++;
+                vec3 vis = traceShadowRayTinted(pos + N * 0.02, skyDir, 65536.0) * pomDirVisibility(skyDir);
+                if (dot(vis, vis) > 0.0) {
+                    float denom = gNoContinuation ? pdfSky : (pdfSky + pdfBsdf);
+                    result += f * NdotL * skyLightRadianceSkybox(skyDir) * vis / denom;
+                }
+            }
+        }
+    }
+
+    PROF_LAP(18);  // sky light
+    PERF_CUT_DL(6u)
+    uint lightCount = p.frameData.w;
+    LightList lightList = lightListAt(pos, lightCount);
+    uint listSize = lightListSize(lightList);
+    uint kBegin = 0u, kEnd = listSize;
+    float lightPickScale = 1.0;
+    // RIS (optional, ptris light word bit 9)
+    const uint risWord = uint(p.causticParams2.w);
+    const uint restirMinLights = p.rrParams.y > 0.5 ? uint(p.rrParams.y + 0.5) - 1u : 0xFFFFFFFFu;
+    const bool restirHere = p.rrParams.y > 0.5 && lightList.cellCount + lightList.globalCount > restirMinLights;
+    if (gBounce == 0u && gSample == 0u && restirHere &&
+        lightList.cellCount + lightList.globalCount > uint(p.rrParams.w + 0.5) + (uint(p.rrParams.z + 0.5) & 7u) + 1u) {
+        restirDirect(lightList, lightCount, pos, N, V, albedo, F0, roughness, metalness, seed, result, staticDirect, lmIrradiance);
+        gRayStat[10] += uint(p.rrParams.w + 0.5) + (uint(p.rrParams.z + 0.5) & 7u) + 1u + lightList.dynCount;
+        for (uint k = lightList.cellCount + lightList.globalCount; k < listSize; ++k) {
+            uint li = lightListGet(lightList, k);
+            if (li < lightCount) accumulatePointLight(li, 1.0, pos, N, V, albedo, F0, roughness, metalness, result, staticDirect, lmIrradiance);
+        }
+        kEnd = 0u; listSize = 0u;  // done, skips RIS and the pick / split / full loops below
+    }
+    // only where the static list is longer than the M x NS candidates RIS would weigh
+    const uint bounceWord = uint(p.rrParams.z + 0.5);
+    const bool risHere = ((risWord >> 9) & 1u) != 0u || (gBounce > 0u && restirHere);
+    const uint risM = gBounce > 0u ? clamp((bounceWord >> 6) & 63u, 1u, 63u) : clamp((risWord >> 10) & 63u, 1u, 63u);
+    const uint risNS = gBounce > 0u ? clamp((bounceWord >> 3) & 7u, 1u, 4u) : clamp((risWord >> 16) & 7u, 1u, 4u);
+    if (risHere && listSize > 0u &&
+        lightList.cellCount + lightList.globalCount > risM * risNS) {
+        const uint M = risM;
+        const uint NS = risNS;
+        const uint staticSize = lightList.cellCount + lightList.globalCount;
+        // a candidate comes from the cell part (chance cellCount / staticSize) by its importance table
+        const bool risImportance = ((risWord >> 23) & 1u) != 0u && lightListHasImportance(lightList);
+        if (staticSize > 0u) {
+            for (uint r = 0u; r < NS; ++r) {
+                float wSum = 0.0, pHatPick = 0.0;
+                uint pick = 0xFFFFFFFFu;
+                for (uint m = 0u; m < M; ++m) {
+                    float u = randFloat(seed) * float(staticSize);
+                    uint slot = min(uint(u), staticSize - 1u);
+                    float pSource = 1.0 / float(staticSize);
+                    if (risImportance && u < float(lightList.cellCount)) {
+                        float pdfInCell;
+                        slot = lightListImportancePick(lightList, u, pdfInCell);
+                        pSource = pdfInCell * float(lightList.cellCount) / float(staticSize);
+                    }
+                    uint li = lightListGet(lightList, slot);
+                    if (li >= lightCount) continue;
+                    float pHat = pointLightSplitWeight(li, pos, N, V, albedo, F0, roughness, metalness);
+                    if (pHat <= 0.0) continue;
+                    float w = pHat / pSource;  // p^ / p_source
+                    wSum += w;
+                    if (randFloat(seed) * wSum < w) { pick = li; pHatPick = pHat; }
+                }
+                if (pick != 0xFFFFFFFFu)
+                    accumulatePointLight(pick, wSum / (float(M) * pHatPick * float(NS)), pos, N, V, albedo, F0, roughness, metalness, result, staticDirect, lmIrradiance);
+            }
+        }
+        gRayStat[10] += M * NS + lightList.dynCount;  // list entries touched (ptstats)
+        for (uint k = staticSize; k < listSize; ++k) {
+            uint li = lightListGet(lightList, k);
+            if (li < lightCount) accumulatePointLight(li, 1.0, pos, N, V, albedo, F0, roughness, metalness, result, staticDirect, lmIrradiance);
+        }
+        kEnd = 0u; listSize = 0u;  // done, skips the pick / split / full loops below
+    }
+    if ((uint(p.causticParams2.w) & 1u) != 0u && gBounce > 0u && listSize > 1u) {
+        float total = 0.0;
+        for (uint k = 0u; k < listSize; ++k) {
+            uint li = lightListGet(lightList, k);
+            if (li < lightCount) total += pointLightPickWeight(li, pos, N);
+        }
+        gRayStat[10] += listSize;
+        kEnd = 0u;  // nothing reaches this point
+        if (total > 0.0) {
+            float u = randFloat(seed) * total, acc = 0.0, wPick = 0.0;
+            uint pickK = 0u;
+            for (uint k = 0u; k < listSize; ++k) {
+                uint li = lightListGet(lightList, k);
+                if (li >= lightCount) continue;
+                float w = pointLightPickWeight(li, pos, N);
+                if (w <= 0.0) continue;
+                acc += w; pickK = k; wPick = w;
+                if (u < acc) break;
+            }
+            if (wPick > 0.0) { kBegin = pickK; kEnd = pickK + 1u; lightPickScale = total / wPick; }
+        }
+    } else {
+        gRayStat[10] += listSize;
+    }
+    // light splitting (ptlightexact K / ptlightrandom S)
+    const uint lightWord = uint(p.causticParams2.w);
+    const uint splitK = min((lightWord >> 1) & 15u, 8u), splitS = (lightWord >> 5) & 15u;
+    if (gBounce == 0u && splitS > 0u && kBegin == 0u && kEnd == listSize && listSize > splitK + splitS) {
+        uint topK[8];
+        float topW[8];
+        for (uint i = 0u; i < 8u; ++i) { topK[i] = 0xFFFFFFFFu; topW[i] = 0.0; }
+        float totalW = 0.0;
+        uint positive = 0u;
+        for (uint k = 0u; k < listSize; ++k) {
+            uint li = lightListGet(lightList, k);
+            if (li >= lightCount) continue;
+            float w = pointLightSplitWeight(li, pos, N, V, albedo, F0, roughness, metalness);
+            if (w <= 0.0) continue;
+            ++positive;
+            if ((int(lights[li].colorFlags.w + 0.5) & 1) != 0) continue;
+            totalW += w;
+            // keep the K largest
+            uint minSlot = 0u;
+            for (uint i = 1u; i < splitK; ++i) if (topW[i] < topW[minSlot]) minSlot = i;
+            if (splitK > 0u && w > topW[minSlot]) { topW[minSlot] = w; topK[minSlot] = k; }
+        }
+        float tailW = totalW;
+        uint ranked = 0u;
+        for (uint i = 0u; i < splitK; ++i) if (topK[i] != 0xFFFFFFFFu) { tailW -= topW[i]; ++ranked; }
+        const bool sampleTail = tailW > 0.0 && positive > ranked + splitS;
+        const float stride = tailW / float(max(splitS, 1u));
+        float nextPick = randFloat(seed) * stride, acc = 0.0;
+        for (uint k = 0u; k < listSize; ++k) {
+            uint li = lightListGet(lightList, k);
+            if (li >= lightCount) continue;
+            bool exact = (int(lights[li].colorFlags.w + 0.5) & 1) != 0 || !sampleTail;
+            for (uint i = 0u; i < splitK; ++i) if (topK[i] == k) exact = true;
+            if (exact) {
+                accumulatePointLight(li, 1.0, pos, N, V, albedo, F0, roughness, metalness, result, staticDirect, lmIrradiance);
+                continue;
+            }
+            float w = pointLightSplitWeight(li, pos, N, V, albedo, F0, roughness, metalness);
+            if (w <= 0.0) continue;
+            acc += w;
+            uint picks = 0u;
+            while (nextPick < acc && picks < splitS) { ++picks; nextPick += stride; }
+            if (picks > 0u)
+                accumulatePointLight(li, float(picks) * tailW / (float(splitS) * w), pos, N, V, albedo, F0, roughness, metalness, result, staticDirect, lmIrradiance);
+        }
+        kEnd = 0u;  // done, skip the plain loop below
+    }
+    for (uint k = kBegin; k < kEnd; ++k) {
+        uint li = lightListGet(lightList, k);
+        if (li >= lightCount) continue;
+        accumulatePointLight(li, lightPickScale, pos, N, V, albedo, F0, roughness, metalness, result, staticDirect, lmIrradiance);
+    }
+
+    gShadowWaterCaustic = 0.0;
+    PROF_LAP(19);  // point lights
+    PERF_CUT_DL(7u)
+    // one importance-chosen emissive (glow) triangle
+    uint emissiveCount = uint(p.skyAmbientPad.w);
+    if (emissiveCount > 0u) {
+        vec3 pointOnTri, triNormal, radiance;
+        float area, lumUnscaled;
+        if (sampleEmissiveTriangle(seed, emissiveCount, pointOnTri, triNormal, area, radiance, lumUnscaled)) {
+            vec3 toLight = pointOnTri - pos;
+            float dist2 = dot(toLight, toLight);
+            float dist = sqrt(dist2);
+            if (dist > 1e-4) {
+                vec3 L = toLight / dist;
+                float NdotL = dot(N, L);
+                float cosThetaLight = abs(dot(triNormal, L));
+                if (NdotL > 0.0 && cosThetaLight > 1e-5) {
+                    float pdfLight = lumUnscaled * dist2 / max(p.emissiveImportancePad.x * cosThetaLight, 1e-8);
+                    float pdfBsdf;
+                    vec3 f = evalBsdf(N, V, L, albedo, F0, roughness, metalness, pdfBsdf);
+                    if (pdfLight + pdfBsdf > 1e-10) {
+                        vec3 origin = pos + N * 0.02;
+                        gRayStat[5]++;
+                        vec3 shadowTint = traceShadowRayTinted(origin, L, dist - 0.04) * pomDirVisibility(L);
+                        if (dot(shadowTint, shadowTint) > 0.0) {
+                            // same balance-heuristic simplification as the sun's contribution above
+                            result += f * NdotL * radiance * shadowTint / (pdfLight + pdfBsdf);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    PROF_LAP(20);  // emissive triangle
+    if (p.skyRotationPad.z > 0.5) {
+        vec3 capScale = min(vec3(1.0), vec3(1.0) / max(lmIrradiance, vec3(1e-6)));
+        staticDirect *= capScale;
+    }
+    lmIrrOut = min(lmIrradiance, vec3(1.0));
+    return result + staticDirect;
+}
+
+// standard octahedral normal encoding (Cigolle et al.)
+vec2 octEncode(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    vec2 result = n.z >= 0.0 ? n.xy : (vec2(1.0) - abs(n.yx)) * vec2(n.x >= 0.0 ? 1.0 : -1.0, n.y >= 0.0 ? 1.0 : -1.0);
+    return result * 0.5 + 0.5;  // [-1,1] -> [0,1] for texture storage
+}
+
+bool fetchHitAttributes(rayQueryEXT rq, out vec3 worldPos, out vec3 normal, out vec3 albedo,
+                         out float specIntensity, out float specScale, out vec3 emission, out float triArea, out float metalness,
+                         out bool isGlass, out bool isWater, out float waterRefThickness, out bool entering, float coneWidthAtOrigin, float coneSpreadAngle, out float coneWidthAtHit);
+
+// a known, ACCEPTED v1 gap
+bool fetchPrimaryPrevWorldPos(rayQueryEXT rq, out vec3 prevWorldPos) {
+    int instanceId = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+    if (instanceId < 0 || instanceId >= materials.length()) return false;
+    MaterialEntry m = materials[instanceId];
+    if (m.vertexAddr == 0ul || m.indexAddr == 0ul || m.prevVertexAddr == 0ul) return false;
+    int primId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    if (rayQueryGetIntersectionGeometryIndexEXT(rq, true) == 1) {
+        primId += int(uint(m.albedoPad.w) / 3u);
+    }
+    IndexBuf ib = IndexBuf(m.indexAddr);
+    uint i0 = ib.i[primId * 3 + 0];
+    uint i1 = ib.i[primId * 3 + 1];
+    uint i2 = ib.i[primId * 3 + 2];
+    vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    vec3 bary = vec3(1.0 - bc.x - bc.y, bc.x, bc.y);
+    VertexBuf pvb = VertexBuf(m.prevVertexAddr);
+    prevWorldPos = pvb.v[i0].pos * bary.x + pvb.v[i1].pos * bary.y + pvb.v[i2].pos * bary.z;
+    return true;
+}
+
+vec3 sampleRealSky(vec3 dir) {
+    if (p.skyFaceIndexHi.z == 0u) return p.skyAmbientPad.xyz;  // no skybox loaded for this map, same fallback this pass always had
+
+    float theta = p.skyRotationPad.x;
+    float ct = cos(-theta), st = sin(-theta);
+    vec3 d = vec3(dir.x * ct - dir.y * st, dir.x * st + dir.y * ct, dir.z);
+
+    vec3 ad = abs(d);
+    uint faceIdx; float u, v, ma;
+    if (ad.x >= ad.y && ad.x >= ad.z) {
+        if (d.x < 0.0) { faceIdx = p.skyFaceIndexLo.x; ma = -d.x; u = 0.5 + 0.5 * (d.y / ma); v = 0.5 - 0.5 * (d.z / ma); }
+        else           { faceIdx = p.skyFaceIndexLo.y; ma =  d.x; u = 0.5 - 0.5 * (d.y / ma); v = 0.5 - 0.5 * (d.z / ma); }
+    } else if (ad.y >= ad.z) {
+        if (d.y < 0.0) { faceIdx = p.skyFaceIndexLo.z; ma = -d.y; u = 0.5 - 0.5 * (d.x / ma); v = 0.5 - 0.5 * (d.z / ma); }
+        else           { faceIdx = p.skyFaceIndexLo.w; ma =  d.y; u = 0.5 + 0.5 * (d.x / ma); v = 0.5 - 0.5 * (d.z / ma); }
+    } else {
+        if (d.z < 0.0) { faceIdx = p.skyFaceIndexHi.x; ma = -d.z; u = 0.5 - 0.5 * (d.y / ma); v = 0.5 - 0.5 * (d.x / ma); }
+        else           { faceIdx = p.skyFaceIndexHi.y; ma =  d.z; u = 0.5 - 0.5 * (d.y / ma); v = 0.5 + 0.5 * (d.x / ma); }
+    }
+
+    if (faceIdx == 0xFFFFFFFFu) return p.skyAmbientPad.xyz;
+
+    vec3 texel = textureLod(uMapTextures[nonuniformEXT(faceIdx)], vec2(u, v), 0.0).rgb;
+    return pow(texel, vec3(2.2)) * 0.35;
+}
+
+// sky-light radiance seen along an escaping ray
+vec3 skyLightRadiance(vec3 dir) {
+    float scale = p.skyRotationPad.y;
+    if (scale <= 0.0) return vec3(0.0);
+    if (dot(p.skyAmbientPad.xyz, p.skyAmbientPad.xyz) > 0.0) return p.skyAmbientPad.xyz * SAUER_LIGHTMAP_OVERBRIGHT * scale;
+    return sampleRealSky(dir) * scale;
+}
+
+bool reconstructPrimary(ivec2 pixel, ivec2 size, vec3 cameraPos, out vec3 worldPos, out vec3 normal, out vec3 albedo,
+                         out float specIntensity, out float specScale, out vec3 emission, out float rawDepth, out float metalness,
+                         out bool isGlass, out bool isWater, out float waterRefThickness, out bool entering, out float coneWidth,
+                         out bool isDynamic, out float linearDist) {
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+    // far-plane unproject to get this pixel's primary-ray direction
+    vec4 clipFar = vec4(uv * 2.0 - 1.0, 1.0, 1.0);
+    vec4 worldFar4 = p.invViewProj * clipFar;
+    vec3 worldFar = worldFar4.xyz / worldFar4.w;
+    vec3 rayDir = normalize(worldFar - cameraPos);
+    {  // this pixel's x+1 / y+1 neighbour rays
+        vec4 fx = p.invViewProj * vec4((uv + vec2(1.0 / float(size.x), 0.0)) * 2.0 - 1.0, 1.0, 1.0);
+        vec4 fy = p.invViewProj * vec4((uv + vec2(0.0, 1.0 / float(size.y))) * 2.0 - 1.0, 1.0, 1.0);
+        gPrimRayOrigin = cameraPos;
+        gPrimDirDx = normalize(fx.xyz / fx.w - cameraPos);
+        gPrimDirDy = normalize(fy.xyz / fy.w - cameraPos);
+    }
+
+    rayQueryEXT rq;
+    gRayStat[1]++;
+    rayQueryInitializeEXT(rq, uTlas, 0u, 0x7F, cameraPos, 0.0, rayDir, 4096.0);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue; if (waterPatchHides(rq)) continue;  // displaced water patch
+        bool alphaTestPassed;
+        MaterialEntry unusedCandidateEntry;
+        if (resolveAlphaTestCandidate(rq, alphaTestPassed, unusedCandidateEntry)) {
+            if (alphaTestPassed) rayQueryConfirmIntersectionEXT(rq);
+            continue;
+        }
+        rayQueryConfirmIntersectionEXT(rq);
+    }
+
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+        // sky / no world geometry along this pixel's primary ray
+        rawDepth = 1.0;
+        isGlass = false;
+        isWater = false;
+        waterRefThickness = 0.0;
+        entering = true;
+        coneWidth = 0.0;
+        isDynamic = false;  // no primary hit at all here, dynamic or otherwise
+        linearDist = 1e6;  // large sentinel
+        imageStore(uPrimaryNormalOut, pixel, vec4(0.0, 0.0, 1000.0, 1000.0));
+        return false;
+    }
+
+    float unusedTriArea;
+    // coneWidth is 0 at the camera itself (the ray origin)
+    gPomApply = true;
+    gPrimaryGradRequest = true;
+    gPomHit = false;
+    bool primaryFetched = fetchHitAttributes(rq, worldPos, normal, albedo, specIntensity, specScale, emission, unusedTriArea, metalness, isGlass, isWater, waterRefThickness, entering,
+                             0.0, p.emissiveImportancePad.y, coneWidth);
+    gPomApply = false;
+    gPrimaryGradRequest = false;
+    if (!primaryFetched) {
+        rawDepth = 1.0;
+        isGlass = false;
+        isWater = false;
+        waterRefThickness = 0.0;
+        entering = true;
+        coneWidth = 0.0;
+        isDynamic = false;
+        linearDist = 1e6;  // same sentinel as the sky-miss case above
+        imageStore(uPrimaryNormalOut, pixel, vec4(0.0, 0.0, 1000.0, 1000.0));
+        return false;
+    }
+
+    // re-derive an NDC depth compatible with pathtrace_resolve.comp's existing reprojection math
+    vec4 clipHit = p.viewProj * vec4(worldPos, 1.0);
+    rawDepth = clipHit.w > 1e-6 ? clamp((clipHit.z / clipHit.w) * 0.5 + 0.5, 0.0, 1.0) : 1.0;
+    linearDist = length(worldPos - cameraPos);
+
+    isDynamic = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) >= int(p.emissiveImportancePad.z);
+
+    vec2 dynamicPrevUv = vec2(1000.0, 1000.0);
+    vec3 prevWorldPos;
+    if (fetchPrimaryPrevWorldPos(rq, prevWorldPos)) {
+        vec4 prevClipJittered = p.prevViewProjJittered * vec4(prevWorldPos, 1.0);
+        if (prevClipJittered.w > 1e-4) {
+            dynamicPrevUv = prevClipJittered.xy / prevClipJittered.w * 0.5 + 0.5;
+        }
+    }
+    vec2 encodedNormal = octEncode(normal);
+    if (isWater && !isDynamic) {
+        vec2 step = vec2(0.0);
+        if (p.waterParams.z > 0.0 && abs(normal.z) >= 0.5 && p.waterVolume.w > 0.0) {
+            // pooled over this pixel's footprint on the water (the neighbour ray's spread), at least 1
+            // unit
+            float footprint = linearDist * length(gPrimDirDx - rayDir) / max(abs(dot(rayDir, normal)), 0.2);
+            step = -waterWaveFlow(worldPos.xy, p.waterFft, p.waterMap, waterAmp(), max(1.0, 1.5 * footprint)) * p.waterVolume.w;
+        }
+        imageStore(uPrimaryNormalOut, pixel, vec4(encodedNormal.x + 4.0, encodedNormal.y, step));
+        return true;
+    }
+    if (gHitLavaGlow > 0.0 && dynamicPrevUv.x > 999.0) dynamicPrevUv = vec2(2000.0, 2000.0);
+    imageStore(uPrimaryNormalOut, pixel, vec4(encodedNormal, dynamicPrevUv.x, dynamicPrevUv.y));
+    return true;
+}
+
+// fetches a bounce hit's position/normal/albedo/material response
+bool fetchHitAttributes(rayQueryEXT rq, out vec3 worldPos, out vec3 normal, out vec3 albedo,
+                         out float specIntensity, out float specScale, out vec3 emission, out float triArea, out float metalness,
+                         out bool isGlass, out bool isWater, out float waterRefThickness, out bool entering, float coneWidthAtOrigin, float coneSpreadAngle, out float coneWidthAtHit) {
+    vec3 origin = rayQueryGetWorldRayOriginEXT(rq);
+    vec3 dir = rayQueryGetWorldRayDirectionEXT(rq);
+    float t = rayQueryGetIntersectionTEXT(rq, true);
+    worldPos = origin + dir * t;
+    // MIPMAPPING for the formula this feeds
+    coneWidthAtHit = coneWidthAtOrigin + coneSpreadAngle * t;
+    gHitEnvRefl = 0.0;
+    gHitRoughOverride = -1.0;
+    gHitSpecWeight = 1.0;
+    gHitModelEmission = false;
+    gHitLavaGlow = 0.0;
+    gHitIsGrass = false;
+    gHitIsDynamic = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true) >= int(p.emissiveImportancePad.z);
+    gUseGrad = false;
+    specIntensity = 0.0;
+    specScale = 1.0;
+    emission = vec3(0.0);
+    triArea = 0.0;
+    metalness = 0.0;
+    isGlass = false;
+    isWater = false;
+    waterRefThickness = 0.0;
+    entering = true;
+
+    int instanceId = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+    if (instanceId < 0 || instanceId >= materials.length()) {
+        normal = -dir;  // defensive fallback, faces back toward the ray, never a zero vector
+        albedo = vec3(0.6);
+        return true;
+    }
+    MaterialEntry m = materials[instanceId];
+    if (m.vertexAddr == 0ul || m.indexAddr == 0ul) {
+        normal = -dir;
+        albedo = m.albedoPad.xyz;
+        return true;
+    }
+
+    int primId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+    if (rayQueryGetIntersectionGeometryIndexEXT(rq, true) == 1) {
+        primId += int(uint(m.albedoPad.w) / 3u);
+    }
+    VertexBuf vb = VertexBuf(m.vertexAddr);
+    IndexBuf ib = IndexBuf(m.indexAddr);
+    uint i0 = ib.i[primId * 3 + 0];
+    uint i1 = ib.i[primId * 3 + 1];
+    uint i2 = ib.i[primId * 3 + 2];
+    ChunkRtVertexGpu vx0 = vb.v[i0];
+    ChunkRtVertexGpu vx1 = vb.v[i1];
+    ChunkRtVertexGpu vx2 = vb.v[i2];
+
+    vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+    vec3 bary = vec3(1.0 - bc.x - bc.y, bc.x, bc.y);
+
+    mat3 objectToWorldRot = mat3(rayQueryGetIntersectionObjectToWorldEXT(rq, true));
+    vec3 rawNormal = normalize(objectToWorldRot * (vx0.normal * bary.x + vx1.normal * bary.y + vx2.normal * bary.z));
+    // entering/exiting determination
+    entering = dot(rawNormal, dir) < 0.0;
+    vec3 geomNormal = rawNormal;
+    if (dot(geomNormal, dir) > 0.0) geomNormal = -geomNormal;  // always face back toward the incoming ray
+    vec4 tangent = vx0.tangent * bary.x + vx1.tangent * bary.y + vx2.tangent * bary.z;
+    tangent.xyz = objectToWorldRot * tangent.xyz;
+    vec2 uv = vx0.uv * bary.x + vx1.uv * bary.y + vx2.uv * bary.z;
+    uint materialIndex = vx0.materialIndex;
+    gHitIsGrass = vx0.alphaTestCutoff >= 2.0;  // path-traced grass
+    MaterialInfo mat = fetchMaterialInfo(materialIndex);
+    uv += mat.scroll.xy * p.waterParams.w;
+    if (gPomApply) gPomHit = false;
+    if (gPomApply && p.pomParams.x > 0.5 && (mat.flags & MATFLAG_PARALLAX) != 0u && mat.normalTexIndex != 0u &&
+        (mat.flags & (MATFLAG_GLASS | MATFLAG_WATER)) == 0u) {
+        vec3 V = -dir;
+        vec3 Tn = tangent.xyz - rawNormal * dot(tangent.xyz, rawNormal);
+        float tl = length(Tn);
+        if (tl > 1e-6 && dot(V, rawNormal) > 0.02) {
+            Tn /= tl;
+            vec3 Bn = cross(rawNormal, Tn) * (tangent.w >= 0.0 ? 1.0 : -1.0);  // same frame applyNormalMap() uses
+            vec3 viewTs = vec3(dot(V, Tn), dot(V, Bn), dot(V, rawNormal));
+            float scale = mat.parallax.x * p.pomParams.z;
+            uint heightTex = floatBitsToUint(mat.parallax.z);
+            if (p.pomParams.w > 0.5 && heightTex != 0u)
+                uv = pomTexcoordQuadtree(uv, viewTs, heightTex, mat.normalTexIndex, scale, mat.parallax.y * p.pomParams.z);
+            else
+                uv = pomTexcoord(uv, viewTs, mat.normalTexIndex, scale, mat.parallax.y * p.pomParams.z);
+            gPomHit = true;
+            gPomUv = uv; gPomT = Tn; gPomB = Bn; gPomN = rawNormal;
+            gPomTex = mat.normalTexIndex; gPomScale = scale;
+        }
+    }
+    // pbr light transport on colorscale.w
+    metalness = mat.colorscale.w;
+    gHitRoughOverride = mat.scroll.z > 0.5 ? mat.scroll.z - 1.0 : -1.0;  // roughness override
+    specScale = decodeSpecScale(mat.flags);
+    isGlass = (mat.flags & (MATFLAG_GLASS | MATFLAG_WATER)) != 0u;
+    isWater = (mat.flags & MATFLAG_WATER) != 0u;
+    waterRefThickness = isWater ? uintBitsToFloat(mat.normalTexIndex) : 0.0;
+
+    uint texIndex = (mat.diffuseTexIndex != 0u) ? mat.diffuseTexIndex : vx0.textureIndex;
+#if PATH_TRACE_DEBUG_TEXTURE_INDEX
+    albedo = vec3(float(texIndex & 255u) / 255.0, float((texIndex >> 8u) & 255u) / 255.0, float((texIndex >> 16u) & 255u) / 255.0);
+    normal = geomNormal;
+#else
+    // MIPMAPPING. Shared once per hit
+    float lodBase = RAYCONE_LOD_ENABLED ? computeRayConeLodBase(vx0.pos, vx1.pos, vx2.pos, vx0.uv, vx1.uv, vx2.uv, coneWidthAtHit, dot(geomNormal, dir)) : 0.0;
+    if (gPrimaryGradRequest) {
+        // neighbour rays onto this triangle's plane (world space, via the instance transform)
+        mat4x3 o2w = rayQueryGetIntersectionObjectToWorldEXT(rq, true);
+        vec3 w0 = o2w * vec4(vx0.pos, 1.0), w1 = o2w * vec4(vx1.pos, 1.0), w2 = o2w * vec4(vx2.pos, 1.0);
+        vec3 nw = cross(w1 - w0, w2 - w0);
+        float ddx = dot(gPrimDirDx, nw), ddy = dot(gPrimDirDy, nw);
+        if (abs(ddx) > 1e-12 && abs(ddy) > 1e-12) {
+            vec3 px = gPrimRayOrigin + gPrimDirDx * (dot(w0 - gPrimRayOrigin, nw) / ddx);
+            vec3 py = gPrimRayOrigin + gPrimDirDy * (dot(w0 - gPrimRayOrigin, nw) / ddy);
+            float gs = p.causticParams2.z > 0.0 ? p.causticParams2.z : 1.0;
+            gDBaryDx = (rtBarycentric(px, w0, w1, w2) - bary) * gs;
+            gDBaryDy = (rtBarycentric(py, w0, w1, w2) - bary) * gs;
+            gUvDx = gDBaryDx.x * vx0.uv + gDBaryDx.y * vx1.uv + gDBaryDx.z * vx2.uv;
+            gUvDy = gDBaryDy.x * vx0.uv + gDBaryDy.y * vx1.uv + gDBaryDy.z * vx2.uv;
+            gUseGrad = all(lessThan(abs(vec4(gUvDx, gUvDy)), vec4(1e4)));  // grazing-limit guard
+        }
+    }
+    if (isGlass && !isWater && texIndex == 0u) {
+        albedo = glassVolumeTint(mat.colorscale.xyz);  // see glassVolumeTint()
+        specIntensity = 0.0;
+    } else if (isWater || texIndex == 0u) {
+        albedo = mat.colorscale.xyz;
+        specIntensity = 0.0;
+    } else {
+        float diffuseLod = computeRayConeLodForTexture(lodBase, textureSize(uMapTextures[nonuniformEXT(texIndex)], 0));
+        vec4 diffuseSample = gUseGrad ? textureGrad(uMapTextures[nonuniformEXT(texIndex)], uv, gUvDx, gUvDy)
+                                      : textureLod(uMapTextures[nonuniformEXT(texIndex)], uv, diffuseLod);
+        albedo = pow(diffuseSample.rgb, vec3(2.2)) * mat.colorscale.xyz;
+        specIntensity = (mat.flags & MATFLAG_SPEC) != 0u ? diffuseSample.a : ((mat.flags & MATFLAG_UNIFORMSPEC) != 0u ? 1.0 : 0.0);
+
+        uint blendMatIdx = vx0.blendMaterialIndex;
+        if (blendMatIdx != 0xFFFFFFFFu) {
+            float blendAlpha = vx0.blendAlpha * bary.x + vx1.blendAlpha * bary.y + vx2.blendAlpha * bary.z;
+            // the blend layer's lightmap alpha
+            if (vx0.blendLmTexIndex != 0u) {
+                vec2 lmUv = vx0.blendLmUv * bary.x + vx1.blendLmUv * bary.y + vx2.blendLmUv * bary.z;
+                blendAlpha = textureLod(uMapTextures[nonuniformEXT(vx0.blendLmTexIndex)], lmUv, 0.0).a;
+            }
+            if (blendAlpha > 0.001) {
+                vec2 blendUv = vx0.blendUv * bary.x + vx1.blendUv * bary.y + vx2.blendUv * bary.z;
+                MaterialInfo blendMat = fetchMaterialInfo(blendMatIdx);
+                uint blendTexIndex = blendMat.diffuseTexIndex;
+                float blendLod = computeRayConeLodForTexture(lodBase, textureSize(uMapTextures[nonuniformEXT(blendTexIndex)], 0));
+                vec4 blendSample;
+                if (gUseGrad) {
+                    vec2 bDx = gDBaryDx.x * vx0.blendUv + gDBaryDx.y * vx1.blendUv + gDBaryDx.z * vx2.blendUv;
+                    vec2 bDy = gDBaryDy.x * vx0.blendUv + gDBaryDy.y * vx1.blendUv + gDBaryDy.z * vx2.blendUv;
+                    blendSample = textureGrad(uMapTextures[nonuniformEXT(blendTexIndex)], blendUv, bDx, bDy);
+                } else {
+                    blendSample = textureLod(uMapTextures[nonuniformEXT(blendTexIndex)], blendUv, blendLod);
+                }
+                vec3 blendAlbedo = pow(blendSample.rgb, vec3(2.2)) * blendMat.colorscale.xyz;
+                float blendSpec = (blendMat.flags & MATFLAG_SPEC) != 0u ? blendSample.a : ((blendMat.flags & MATFLAG_UNIFORMSPEC) != 0u ? 1.0 : 0.0);
+                albedo = mix(albedo, blendAlbedo, blendAlpha);
+                specIntensity = mix(specIntensity, blendSpec, blendAlpha);
+                specScale = mix(specScale, decodeSpecScale(blendMat.flags), blendAlpha);
+            }
+        }
+    }
+
+    // alpha-geometry glass (textured)
+    if (isGlass && !isWater && texIndex != 0u) albedo = mix(vec3(1.0), albedo, clamp(p.glassParams.y, 0.0, 1.0));
+    if ((materialIndex & 0x80000000u) != 0u && materialIndex != 0xFFFFFFFFu && texIndex != 0u) {
+        float mdlSpec = float((materialIndex >> 16u) & 0xFFu) / 63.75;
+        uint masksTex = materialIndex & 0xFFFFu;
+        vec3 masks = masksTex != 0u ? textureLod(uMapTextures[nonuniformEXT(masksTex)], uv, 0.0).rgb : vec3(1.0, 0.0, 0.0);
+        specIntensity = clamp(0.5 * mdlSpec * masks.r, 0.0, 1.0);
+        // models use the fallback MaterialInfo (flags 0), whose decoded specscale is 0
+        specScale = 1.0;
+        if (masksTex != 0u) {
+            // reflectance = masks.b * ptmodelreflect (1 = a 100% mirror)
+            gHitEnvRefl = clamp(masks.b * p.glassParams.z, 0.0, 1.0);
+            specIntensity = max(specIntensity, p.matParams.x > 0.5 ? masks.b * MAT_MIRROR_KS : masks.b);
+            // the glow-masked parts emit albedo * mask * strength
+            float emStrength = float((materialIndex >> 24u) & 0x7Fu) * 0.25;
+            float glowMask = smoothstep(0.03, 0.08, masks.g) * masks.g;
+            if (emStrength > 0.0 && glowMask > 0.0) {
+                emission += albedo * glowMask * emStrength;
+                gHitModelEmission = true;
+            }
+        }
+    }
+    normal = geomNormal;
+    if ((mat.flags & MATFLAG_NORMAL) != 0u && mat.normalTexIndex != 0u) {
+        float normalLod = computeRayConeLodForTexture(lodBase, textureSize(uMapTextures[nonuniformEXT(mat.normalTexIndex)], 0));
+        normal = applyNormalMap(geomNormal, tangent, uv, mat.normalTexIndex, normalLod);
+        normal = faceViewer(normal, dir);
+    }
+    if (isWater) {  // animated waves on the flat surface
+        normal = waterWaveNormal(worldPos, rawNormal);
+        if (dot(normal, dir) > 0.0) normal = -normal;
+    }
+    if ((mat.flags & MATFLAG_GLOW) != 0u && mat.glowTexIndex != 0u) {
+        float glowLod = computeRayConeLodForTexture(lodBase, textureSize(uMapTextures[nonuniformEXT(mat.glowTexIndex)], 0));
+        vec3 glowTexel = gUseGrad ? textureGrad(uMapTextures[nonuniformEXT(mat.glowTexIndex)], uv, gUvDx, gUvDy).rgb
+                                  : textureLod(uMapTextures[nonuniformEXT(mat.glowTexIndex)], uv, glowLod).rgb;
+        emission = pow(glowTexel, vec3(2.2)) * mat.glowcolor.xyz * p.ambientFloorPad.w;
+        vec3 e1 = vx1.pos - vx0.pos;
+        vec3 e2 = vx2.pos - vx0.pos;
+        triArea = 0.5 * length(cross(e1, e2));
+    }
+    if ((mat.flags & MATFLAG_LAVA) != 0u) {  // see lavaSurface()
+        LavaSurfaceInfo ls = lavaSurfaceP(worldPos, geomNormal, mat.glowcolor.x);
+        emission = ls.emission * p.ambientFloorPad.w;
+        albedo = vec3(ls.albedo);
+        gHitRoughOverride = ls.roughness;
+        gHitSpecWeight = ls.specWeight;
+        specIntensity = 0.0;
+        normal = faceViewer(ls.normal, dir);
+        gHitLavaGlow = mat.glowcolor.x;
+        vec3 e1 = vx1.pos - vx0.pos;
+        vec3 e2 = vx2.pos - vx0.pos;
+        triArea = 0.5 * length(cross(e1, e2));
+    }
+#endif
+    return true;
+}
+
+#if defined(RADIANCE_CACHE_PASS)
+layout(local_size_x = 256) in;
+void main() {
+    uint sl = gl_GlobalInvocationID.x;
+    if (sl >= RC_SIZE) return;
+    uvec2 key = rcKeys[sl];
+    if (key.x == 0u) return;
+    uvec4 a = rcAccum[sl];
+    uint frame = p.frameData.x;
+    if (a.w > 0u) {
+        vec3 L = vec3(a.xyz) / (RC_SCALE * float(a.w));
+        vec4 r = rcRadiance[sl];
+        if (!finite3(r.rgb) || !(r.w >= 0.0)) r = vec4(0.0);  // defensive
+        float n = min(r.w + 1.0, max(p.cacheParams.z, 1.0));
+        r.rgb = mix(r.rgb, L, 1.0 / n);
+        r.w = n;
+        rcRadiance[sl] = r;
+        rcAccum[sl] = uvec4(0u);
+        rcKeys[sl].y = frame;
+    } else if (frame - key.y > uint(p.cacheParams2.z)) {
+        rcKeys[sl] = uvec2(0u);
+        rcRadiance[sl] = vec4(0.0);
+    }
+}
+#elif defined(SKY_CDF_PASS)
+// skybox light builds the sky's sampling distribution (see skybox light)
+layout(local_size_x = 256) in;
+shared float sSum[256];
+shared float sEup[256];
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    const uint PER = SKY_CELLS / 256u;
+    float lum[PER];
+    float sum = 0.0, eup = 0.0;
+    for (uint i = 0u; i < PER; ++i) {
+        uint cell = t * PER + i;
+        vec2 base = vec2(float(cell % SKY_W), float(cell / SKY_W));
+        float l = 0.0;
+        for (uint k = 0u; k < 4u; ++k) {
+            vec2 uv = (base + vec2(0.25 + 0.5 * float(k & 1u), 0.25 + 0.5 * float(k >> 1))) / vec2(float(SKY_W), float(SKY_H));
+            vec3 dl = skyUvToDir(uv);
+            float sl = luminance(sampleRealSky(skyLocalToWorld(dl)));
+            l += sl;
+            eup += sl * max(dl.z, 0.0);
+        }
+        lum[i] = l * 0.25;
+        sum += lum[i];
+    }
+    sSum[t] = sum; sEup[t] = eup;
+    barrier();
+    for (uint off = 128u; off > 0u; off >>= 1) {
+        if (t < off) { sSum[t] += sSum[t + off]; sEup[t] += sEup[t + off]; }
+        barrier();
+    }
+    float total = sSum[0];
+    float eUp = sEup[0] * (4.0 * PI / float(SKY_CELLS * 4u));  // each sample covers 4pi / (cells * 4) sr
+    barrier();
+    // A small floor keeps every cell sampleable (pdf > 0 wherever the sky has light)
+    float floorW = 0.02 * total / float(SKY_CELLS);
+    float local = 0.0;
+    for (uint i = 0u; i < PER; ++i) { lum[i] += floorW; local += lum[i]; }
+    // inclusive scan of the per-thread sums (Hillis-Steele)
+    sSum[t] = local;
+    barrier();
+    for (uint off = 1u; off < 256u; off <<= 1) {
+        float v = t >= off ? sSum[t - off] : 0.0;
+        barrier();
+        sSum[t] += v;
+        barrier();
+    }
+    float grand = sSum[255];
+    float acc = sSum[t] - local;
+    float inv = grand > 0.0 ? 1.0 / grand : 0.0;
+    for (uint i = 0u; i < PER; ++i) { acc += lum[i]; skyCdf[t * PER + i] = (t == 255u && i == PER - 1u) ? 1.0 : acc * inv; }
+    if (t == 0u) {
+        // calibration
+        float target = PI * luminance(p.skyAmbientPad.xyz * SAUER_LIGHTMAP_OVERBRIGHT);
+        float calib = target > 0.0 ? target / max(eUp, 1e-6) : 1.0;
+        skyHeader = vec4(calib * p.skyRotationPad.y, float(SKY_CELLS) / (4.0 * PI), 0.0, (total > 0.0 && p.skyRotationPad.y > 0.0) ? 1.0 : 0.0);
+    }
+}
+#elif !defined(CAUSTIC_PHOTON_PASS)
+// unpolarised Fresnel reflectance of a smooth dielectric interface
+
+// path-traced water the reflection half of a water surface the camera sees (see main())
+bool particleSpriteCandidate(rayQueryEXT rq, out vec3 emission) {
+    emission = vec3(0.0);
+    int id = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, false);
+    if (id < 0 || id >= materials.length()) return false;
+    MaterialEntry m = materials[id];
+    if (m.vertexAddr == 0ul || m.indexAddr == 0ul) return false;
+    uint prim = uint(rayQueryGetIntersectionPrimitiveIndexEXT(rq, false));
+    VertexBuf vb = VertexBuf(m.vertexAddr);
+    IndexBuf ib = IndexBuf(m.indexAddr);
+    uint i0 = ib.i[prim * 3u + 0u];
+    if (vb.v[i0].materialIndex != PARTICLE_MATERIAL) return false;
+    uint i1 = ib.i[prim * 3u + 1u], i2 = ib.i[prim * 3u + 2u];
+    vec2 bc = rayQueryGetIntersectionBarycentricsEXT(rq, false);
+    vec2 uv = vb.v[i0].uv * (1.0 - bc.x - bc.y) + vb.v[i1].uv * bc.x + vb.v[i2].uv * bc.y;
+    vec4 t = textureLod(uMapTextures[nonuniformEXT(vb.v[i0].textureIndex)], uv, 0.0);
+    // radial sprites (explosion discs, tangent.x = 1)
+    if (vb.v[i0].tangent.x > 0.5) t.a *= 1.0 - smoothstep(0.25, 0.5, length(uv - 0.5));
+    emission = pow(max(t.rgb * vb.v[i0].normal, vec3(0.0)), vec3(2.2)) * t.a * (4.0 * p.particleParams.x);
+    return true;
+}
+// the sprites a ray passes before its hit (tMax)
+vec3 spritesAlong(vec3 origin, vec3 dir, float tMin, float tMax) {
+    rayQueryEXT sq;
+    rayQueryInitializeEXT(sq, uTlas, gl_RayFlagsNoOpaqueEXT, RAYMASK_PARTICLE, origin, tMin, dir, tMax);
+    vec3 sum = vec3(0.0);
+    while (rayQueryProceedEXT(sq)) {
+        if (rayQueryGetIntersectionTypeEXT(sq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue;
+        vec3 e;
+        if (particleSpriteCandidate(sq, e)) sum += e;
+    }
+    return sum;
+}
+
+float hgPhase(float cosT, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * cosT, 1e-4), 1.5));
+}
+// horizontal drift per unit depth of light refracted into the water at xy
+vec2 waterRefractDrift(vec2 xy, vec3 dIn) {
+    vec3 n = waterWaveNormalAt(xy, p.waterFft, p.waterMap, waterAmp(), 1.0);
+    vec3 t = refract(dIn, n, 1.0 / IOR_WATER);
+    return t.z < -1e-3 ? t.xy / -t.z : vec2(0.0);
+}
+// light concentration h units below surface point s
+float waterFocusing(vec2 s, vec3 dIn, float h) {
+    if (p.waterVolume.z <= 0.0 || p.waterWave.w < 0.5) return 1.0;
+    float e = clamp(0.25 + h * 0.01, 0.25, 8.0);
+    vec2 ddx = (waterRefractDrift(s + vec2(e, 0.0), dIn) - waterRefractDrift(s - vec2(e, 0.0), dIn)) / (2.0 * e);
+    vec2 ddy = (waterRefractDrift(s + vec2(0.0, e), dIn) - waterRefractDrift(s - vec2(0.0, e), dIn)) / (2.0 * e);
+    mat2 J = mat2(1.0) + h * mat2(ddx, ddy);
+    float f = min(1.0 / max(abs(determinant(J)), 0.125), 8.0);
+    return mix(1.0, f, p.waterVolume.z);
+}
+vec3 waterLightThroughSurface(vec3 x, float surfaceZ, vec3 sigma, vec3 dIn, vec3 lightPos, bool atInfinity, out vec3 toLight, out float pathLen) {
+    toLight = vec3(0.0, 0.0, 1.0);
+    pathLen = 0.0;
+    vec3 t0 = refract(dIn, vec3(0.0, 0.0, 1.0), 1.0 / IOR_WATER);
+    if (t0.z > -1e-3) return vec3(0.0);
+    float h = surfaceZ - x.z;
+    float upLen = h / -t0.z;
+    toLight = -t0;
+    vec3 s = x - t0 * upLen;
+    // underwater leg (absorbed to the surface)
+    gShadowWaterSigma = sigma;
+    gShadowWaterSurfaceZ = surfaceZ;
+    vec3 v = traceShadowRayTinted(x, -t0, upLen + 0.5);
+    gShadowWaterSigma = vec3(0.0);
+    if (dot(v, v) <= 0.0) return vec3(0.0);
+    // above-water leg
+    vec3 s2 = vec3(s.xy, surfaceZ + 0.05);
+    vec3 up = atInfinity ? -dIn : lightPos - s2;
+    float upDist = atInfinity ? 4096.0 : length(up);
+    if (!atInfinity) up /= max(upDist, 1e-4);
+    v *= traceShadowRayTinted(s2, up, atInfinity ? upDist : max(upDist - 0.5, 0.0));
+    if (dot(v, v) <= 0.0) return vec3(0.0);
+    pathLen = upLen + (atInfinity ? 0.0 : upDist);
+    float Tfres = 1.0 - fresnelDielectric(clamp(-dIn.z, 0.0, 1.0), 1.0, IOR_WATER);
+    return v * Tfres * waterFocusing(s.xy, dIn, h);
+}
+vec3 waterVolumeInscatter(vec3 o, vec3 dir, float segLen, vec3 sigma, float surfaceZ, inout uint seed) {
+    if (p.waterVolume.x <= 0.0 || segLen <= 1e-3) return vec3(0.0);
+    float sBar = max((sigma.r + sigma.g + sigma.b) / 3.0, 1e-5);
+    float L = min(segLen, 12.0 / sBar);  // past e^-12 nothing comes back
+    float norm = 1.0 - exp(-sBar * L);
+    float t = -log(1.0 - randFloat(seed) * norm) / sBar;
+    float pdf = sBar * exp(-sBar * t) / max(norm, 1e-8);
+    vec3 x = o + dir * t;
+    if (surfaceZ - x.z <= 0.05) return vec3(0.0);
+    const float savedCaustic = gShadowWaterCaustic;
+    gShadowWaterCaustic = 0.0;  // the water surface transmits here, no photon handoff
+
+    bool hasSun = dot(p.sunColorPad.xyz, p.sunColorPad.xyz) > 0.0;
+    uint lightCount = p.frameData.w;
+    bool hasLights = lightCount > 0u;
+    bool pickSun = hasSun && (!hasLights || randFloat(seed) < 0.5);
+    float pickScale = (hasSun && hasLights) ? 2.0 : 1.0;
+    vec3 Li = vec3(0.0), toLight = vec3(0.0, 0.0, 1.0);
+    float pathLen;
+    if (pickSun) {
+        vec3 dIn = normalize(p.sunDirectionRadius.xyz);  // direction sunlight travels
+        Li = p.sunColorPad.xyz * SAUER_LIGHTMAP_OVERBRIGHT * waterLightThroughSurface(x, surfaceZ, sigma, dIn, vec3(0.0), true, toLight, pathLen);
+    } else if (hasLights) {
+        // one point light, picked by its unshadowed strength here
+        LightList ll = lightListAt(vec3(x.xy, surfaceZ), lightCount);
+        uint n = lightListSize(ll);
+        float total = 0.0;
+        for (uint k = 0u; k < n; ++k) {
+            uint li = lightListGet(ll, k);
+            if (li >= lightCount) continue;
+            float d = length(lightNearestPoint(lights[li].posRadius.xyz, lightHalfAxis(lights[li].colorFlags, lights[li].reserved), x) - x);
+            bool noFalloff = (int(lights[li].colorFlags.w + 0.5) & 2) != 0;
+            if (!noFalloff && d >= lights[li].posRadius.w) continue;
+            total += luminance(lights[li].colorFlags.xyz) * (noFalloff ? 1.0 : 1.0 - d / lights[li].posRadius.w);
+        }
+        if (total > 0.0) {
+            float u = randFloat(seed) * total, acc = 0.0, wPick = 0.0;
+            uint pick = 0xFFFFFFFFu;
+            for (uint k = 0u; k < n; ++k) {
+                uint li = lightListGet(ll, k);
+                if (li >= lightCount) continue;
+                float d = length(lightNearestPoint(lights[li].posRadius.xyz, lightHalfAxis(lights[li].colorFlags, lights[li].reserved), x) - x);
+                bool noFalloff = (int(lights[li].colorFlags.w + 0.5) & 2) != 0;
+                if (!noFalloff && d >= lights[li].posRadius.w) continue;
+                float w = luminance(lights[li].colorFlags.xyz) * (noFalloff ? 1.0 : 1.0 - d / lights[li].posRadius.w);
+                acc += w; pick = li; wPick = w;
+                if (u < acc) break;
+            }
+            if (pick != 0xFFFFFFFFu && wPick > 0.0) {
+                pickScale *= total / wPick;
+                vec3 lp = lightNearestPoint(lights[pick].posRadius.xyz, lightHalfAxis(lights[pick].colorFlags, lights[pick].reserved), x);
+                float radius = lights[pick].posRadius.w;
+                int flagBits = int(lights[pick].colorFlags.w + 0.5);
+                bool noFalloff = (flagBits & 2) != 0;
+                vec3 col = lights[pick].colorFlags.xyz * ((flagBits & 1) != 0 ? 1.0 : SAUER_LIGHTMAP_OVERBRIGHT);
+                if (lp.z > surfaceZ + 0.1) {
+                    // above the water
+                    vec3 straight = normalize(lp - x);
+                    vec3 s0 = x + straight * waterPlaneT(x, straight, surfaceZ);
+                    vec3 dIn = normalize(s0 - lp);
+                    vec3 v = waterLightThroughSurface(x, surfaceZ, sigma, dIn, lp, false, toLight, pathLen);
+                    float atten = (noFalloff ? 1.0 : max(1.0 - pathLen / radius, 0.0)) * lightFacing(pick, dIn);
+                    Li = col * atten * v;
+                } else {
+                    // under the water too
+                    float d = length(lp - x);
+                    toLight = (lp - x) / max(d, 1e-4);
+                    gShadowWaterSigma = sigma;
+                    gShadowWaterSurfaceZ = surfaceZ;
+                    vec3 v = traceShadowRayTinted(x, toLight, max(d - max(lightShadowGap(lights[pick].colorFlags, lights[pick].reserved), 0.04), 0.0));
+                    gShadowWaterSigma = vec3(0.0);
+                    float atten = (noFalloff ? 1.0 : max(1.0 - d / radius, 0.0)) * lightFacing(pick, -toLight);
+                    Li = col * atten * v;
+                }
+            }
+        }
+    }
+    gShadowWaterCaustic = savedCaustic;
+    if (dot(Li, Li) <= 0.0) return vec3(0.0);
+    vec3 Tcam = exp(-sigma * t);
+    return Tcam * (p.waterVolume.x * hgPhase(dot(toLight, dir), p.waterVolume.y) * SAUER_BRDF_PI_COMPENSATION / pdf) * Li * pickScale;
+}
+
+vec3 waterReflectionSurface(rayQueryEXT rq, vec3 dir, bool reflMissed, inout uint seed);
+vec3 waterReflectionRadiance(vec3 origin, vec3 dir, inout uint seed) {
+    rayQueryEXT rq;
+    const bool sprites = p.particleParams.x > 0.0 && p.particleParams.y > 0.5;
+    rayQueryInitializeEXT(rq, uTlas, 0u, RAYMASK_WORLD, origin + dir * 0.02, 0.0015, dir, 4096.0);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue; if (waterPatchHides(rq)) continue;  // displaced water patch
+        bool alphaTestPassed;
+        MaterialEntry unusedEntry;
+        if (resolveAlphaTestCandidate(rq, alphaTestPassed, unusedEntry)) {
+            if (alphaTestPassed) rayQueryConfirmIntersectionEXT(rq);
+            continue;
+        }
+        rayQueryConfirmIntersectionEXT(rq);
+    }
+    gRayStat[6]++;
+    const bool reflMissed = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
+    vec3 spriteL = sprites ? spritesAlong(origin + dir * 0.02, dir, 0.0015, reflMissed ? 4096.0 : rayQueryGetIntersectionTEXT(rq, true)) : vec3(0.0);
+    return spriteL + waterReflectionSurface(rq, dir, reflMissed, seed);
+}
+vec3 waterReflectionSurface(rayQueryEXT rq, vec3 dir, bool reflMissed, inout uint seed) {
+    if (reflMissed) {
+        vec3 L = sampleRealSky(dir);
+        if (dot(p.sunColorPad.xyz, p.sunColorPad.xyz) > 0.0) {
+            float ar = max(p.sunDirectionRadius.w, 1e-4);
+            if (dot(dir, normalize(-p.sunDirectionRadius.xyz)) >= cos(ar))
+                L += p.sunColorPad.xyz / max(PI * ar * ar, 1e-8) * SAUER_LIGHTMAP_OVERBRIGHT * SAUER_BRDF_PI_COMPENSATION;
+        }
+        return L;
+    }
+    vec3 hp, hn, ha, he;
+    float hs, hss, hta, hm, hwr, hcw;
+    bool hg, hw, hen;
+    if (!fetchHitAttributes(rq, hp, hn, ha, hs, hss, he, hta, hm, hg, hw, hwr, hen, 0.0, p.emissiveImportancePad.y, hcw)) return vec3(0.0);
+    vec3 floorL = ha * p.ambientFloorPad.xyz * SAUER_LIGHTMAP_OVERBRIGHT;
+    if (hg) return floorL;  // glass/water seen in the reflection
+    float hitRoughOverride = gHitRoughOverride;
+    float rough = surfaceRoughness(hs * hss, hitRoughOverride);
+    rough = mix(rough, min(rough, 0.02), hm);
+    vec3 F0 = mix(DIELECTRIC_F0, ha, hm);
+    gSpecWeight = ((hs * hss > 0.001 || hm > 0.001 || hitRoughOverride >= 0.0) ? 1.0 : clamp(p.skyRotationPad.w, 0.0, 1.0)) * gHitSpecWeight;
+    vec3 lmIrr;
+    gNoContinuation = true;
+    vec3 direct = directLighting(hp, hn, -dir, ha, F0, rough, hm, seed, lmIrr);
+    gNoContinuation = false;
+    return max(he + direct, floorL);
+}
+
+// RR moves a reflection by these, not by the surface's motion
+float specularVirtualDistance(vec3 cameraPos, vec3 worldPos, vec3 N, float primaryDist) {
+    vec3 V = normalize(worldPos - cameraPos);
+    if (dot(N, V) > 0.0) N = -N;  // face the camera (under-water / back faces)
+    vec3 R = reflect(V, N);
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uTlas, gl_RayFlagsOpaqueEXT, 0x7F, worldPos + N * 0.02, 0.0, R, 4096.0);
+    while (rayQueryProceedEXT(rq)) {}
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return 60000.0;
+    return min(primaryDist + rayQueryGetIntersectionTEXT(rq, true), 59000.0);
+}
+
+void main() {
+    ivec2 size = imageSize(uRawRadiance);
+#ifdef PT_RAYGEN
+    ivec2 pixel = ivec2(gl_LaunchIDEXT.xy);
+#else
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+#endif
+    if (pixel.x >= size.x || pixel.y >= size.y) return;
+#ifdef PT_SER_TOP
+    SER_REORDER(0u, 1u);  // one reorder before anything else
+#endif
+#ifdef PT_SER_MIN
+    imageStore(uRawRadiance, pixel, vec4(0.0, 0.0, 0.0, 1.0)); return;  // reorder, then nothing
+#endif
+#ifdef PT_SER_RQ
+    {  // reorder, then one bare ray query from the camera
+        vec3 camP = (p.invView * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+        vec2 ndc = (vec2(pixel) + 0.5) / vec2(size) * 2.0 - 1.0;
+        vec4 fp = p.invViewProj * vec4(ndc, 1.0, 1.0);
+        vec3 d = normalize(fp.xyz / fp.w - camP);
+        rayQueryEXT dq;
+#ifdef PT_SER_CAND
+        rayQueryInitializeEXT(dq, uTlas, 0u, 0x7Fu, camP, 0.0, d, 4096.0);  // non-opaque
+        while (rayQueryProceedEXT(dq)) {
+#ifdef PT_SER_ALPHA
+            if (rayQueryGetIntersectionTypeEXT(dq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue; if (waterPatchHides(dq)) continue;
+            bool atp; MaterialEntry unusedE;
+            if (resolveAlphaTestCandidate(dq, atp, unusedE)) { if (atp) rayQueryConfirmIntersectionEXT(dq); continue; }
+            rayQueryConfirmIntersectionEXT(dq);
+#else
+            if (rayQueryGetIntersectionTypeEXT(dq, false) == gl_RayQueryCandidateIntersectionTriangleEXT) rayQueryConfirmIntersectionEXT(dq);
+#endif
+        }
+#else
+        rayQueryInitializeEXT(dq, uTlas, gl_RayFlagsOpaqueEXT, 0xFFu, camP, 0.0, d, 4096.0);
+        while (rayQueryProceedEXT(dq)) {}
+#endif
+        float t = rayQueryGetIntersectionTypeEXT(dq, true) != gl_RayQueryCommittedIntersectionNoneEXT ? rayQueryGetIntersectionTEXT(dq, true) : 0.0;
+#ifdef PT_SER_FETCH
+        vec3 hitPos, hitN, hitAlbedo, hitEmission;
+        float hs, hss, hta, hm, hwt, hcw;
+        bool hg, hw, he;
+        if (t > 0.0 && fetchHitAttributes(dq, hitPos, hitN, hitAlbedo, hs, hss, hitEmission, hta, hm, hg, hw, hwt, he, 0.0, 0.0, hcw)) {
+#ifdef PT_SER_PREV
+            vec3 prevWP;
+            if (fetchPrimaryPrevWorldPos(dq, prevWP)) hitAlbedo += prevWP * 1e-6;
+#endif
+            imageStore(uRawRadiance, pixel, vec4(hitAlbedo, 1.0));
+        }
+        else
+#endif
+        imageStore(uRawRadiance, pixel, vec4(vec3(t / 1000.0), 1.0));
+        return;
+    }
+#endif
+    PROF_START();
+    // blue noise
+    gPixel = pixel;
+
+    vec3 cameraPos = (p.invView * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+
+    vec3 worldPos, normal, albedo, primaryEmission;
+    float specIntensity, specScale, rawDepth, metalness;
+    // linear distance from the camera to this pixel's primary hit
+    float linearDist;
+    bool primaryIsGlass, primaryIsWater, primaryEntering;
+    // animated water
+    float primaryWaterRefThickness;
+    // the ray-cone width at the primary hit, carried forward below as the starting width for the first
+    // bounce ray
+    float coneWidth;
+    bool primaryIsDynamic;
+    bool primaryHit = reconstructPrimary(pixel, size, cameraPos, worldPos, normal, albedo, specIntensity, specScale, primaryEmission, rawDepth, metalness, primaryIsGlass, primaryIsWater, primaryWaterRefThickness, primaryEntering, coneWidth, primaryIsDynamic, linearDist);
+    PROF_LAP(1);
+    if (!primaryHit) {
+        // sky / no geometry nothing to shade except the skybox itself
+        {
+            vec2 missUv = (vec2(pixel) + 0.5) / vec2(size);
+            vec4 missClipFar = vec4(missUv * 2.0 - 1.0, 1.0, 1.0);
+            vec4 missWorldFar4 = p.invViewProj * missClipFar;
+            vec3 missWorldFar = missWorldFar4.xyz / missWorldFar4.w;
+            vec3 missRayDir = normalize(missWorldFar - cameraPos);
+            imageStore(uRawRadiance, pixel, vec4(sampleRealSky(missRayDir), 1.0));
+        }
+        imageStore(uLinearDepthOut, pixel, vec4(linearDist, 0.0, 0.0, 0.0));
+        gRayStat[9]++;
+        PROF_LAP(14);
+        PROF_FINISH();
+        flushRayStats();
+        return;
+    }
+
+    // primary hit's model env-reflection (see gHitEnvRefl)
+#ifdef PT_SER_PRIMARY
+    imageStore(uRawRadiance, pixel, vec4(albedo, rawDepth)); return;  // reorder, primary hit, stop (rest compiled out)
+#endif
+    const uint ptCut = perfCutValue();
+    if (ptCut == 1u) {
+        imageStore(uRawRadiance, pixel, vec4(albedo, primaryIsDynamic ? -rawDepth : rawDepth));
+        imageStore(uLinearDepthOut, pixel, vec4(linearDist, 0.0, 0.0, 0.0));
+        flushRayStats();
+        return;
+    }
+    float primaryEnvRefl = gHitEnvRefl;
+    float primaryRoughOverride = gHitRoughOverride;  // roughness override
+    float primarySpecWeight = gHitSpecWeight;
+    bool primaryEmissiveModel = gHitModelEmission;
+    bool primaryIsGrass = gHitIsGrass;  // path-traced grass
+    // dlss-rr specular motion vectors
+    float specVirtualDist = 0.0;
+    if (!primaryIsGrass) {
+        float primaryRough = surfaceRoughness(specIntensity * specScale, primaryRoughOverride);
+        bool mirrorLike = primaryIsWater || primaryIsGlass || metalness > 0.5 || primaryEnvRefl > 0.0;
+        if (p.rrParams.x > 0.5 ? (mirrorLike || primaryRough < 0.5) : (mirrorLike || primaryRough < 0.25))
+        {
+            PROF_LAP(8);
+            specVirtualDist = specularVirtualDistance(cameraPos, worldPos, normal, linearDist);
+            PROF_LAP(7);
+        }
+    }
+
+    // trace this many full paths from the shared primary hit and average them
+    uint sppCount = clamp(p.frameData.y >> 16u, 1u, 64u);
+    vec3 radianceAccum = vec3(0.0);
+    // what the camera path's first underwater segment did, see the imageStore below
+    vec3 waterDebug = vec3(-1.0);
+    float fogLinearDist = linearDist;  // see deltaChain, glass pixels report the distance through the glass
+    for (uint sampleIdx = 0u; sampleIdx < sppCount; ++sampleIdx) {
+    gSample = sampleIdx;
+    uint seed = pcgHash(uint(pixel.x) * 1973u ^ pcgHash(uint(pixel.y) * 9277u ^ pcgHash(p.frameData.x * 26699u + 1u + sampleIdx * 0x9E3779B9u)));
+
+    vec3 radiance = primaryEmission;
+    vec3 throughput = vec3(1.0);
+    vec3 curPos = worldPos;
+    vec3 curNormal = normal;
+    vec3 curAlbedo = albedo;
+    float curSpecIntensity = specIntensity;
+    float curSpecScale = specScale;
+    float curMetalness = metalness;
+    float curEnvRefl = primaryEnvRefl;
+    float curRoughOverride = primaryRoughOverride;
+    float curSpecWeight = primarySpecWeight;
+    bool curEmissiveModel = primaryEmissiveModel;
+    bool curIsGrass = primaryIsGrass;
+    bool curIsGlass = primaryIsGlass;
+    // vertices this path shades, written back at its end
+    bool rcOn = p.cacheParams.x > 0.5;
+    // an update path goes a bounce deeper than the rest, and a warp waits for its slowest lane
+    const bool rcCoherent = (uint(p.cacheParams2.w + 0.5) & 2u) != 0u;
+    const uvec2 rcKeyPx = rcCoherent ? uvec2(uint(pixel.x) >> 3u, uint(pixel.y) >> 2u) : uvec2(pixel);
+    bool rcUpdatePath = rcOn && (pcgHash(rcKeyPx.x * 7919u ^ pcgHash(rcKeyPx.y * 104729u ^ p.frameData.x * 2654435761u ^ sampleIdx)) % max(uint(p.cacheParams.w), 1u)) == 0u;
+    uint rcSlot[4], rcCheck[4];
+    vec3 rcBefore[4], rcT[4];
+    uint rcCount = 0u;
+    bool curIsDynamic = primaryIsDynamic;
+    vec3 diagRadAtDeep = vec3(-1.0);  // see gRayStat
+    // transport albedo viewChain
+    bool viewChain = true;
+    vec3 curDisplayToTransport = primaryIsGlass ? vec3(1.0) : displayToTransportRatio(albedo);
+    // animated water
+    bool curIsWater = primaryIsWater;
+    float curWaterRefThickness = primaryWaterRefThickness;
+    bool curEntering = primaryEntering;
+    vec3 primaryAlbedo = albedo;
+    vec3 prevDir = normalize(worldPos - cameraPos);  // the primary camera ray's own direction, for the very first V below
+    // constant spread angle across every bounce
+    float coneSpreadAngle = p.emissiveImportancePad.y;
+
+    bool primaryEscapedToSky = false;
+    // true while every bounce so far was a delta (glass/water) pick
+    bool deltaChain = true;
+    bool glassFogDone = !primaryIsGlass;
+    float glassFogDist = linearDist;
+    vec3 floorAlbedo = primaryIsGlass ? vec3(0.0) : albedo * (1.0 - primaryEnvRefl);
+    vec3 curLmIrradiance = vec3(0.0);
+
+    // glass state
+    bool insideGlass = false;
+    // water fades toward its colour with depth
+    bool glassMediumIsWater = false;
+    vec3 glassEntryPos = vec3(0.0);
+    vec3 glassTint = vec3(1.0);
+    const float GLASS_REFERENCE_THICKNESS = 8.0;
+    float glassReferenceThickness = GLASS_REFERENCE_THICKNESS;
+
+    uint bounces = p.frameData.y & 0xFFFFu;
+    const uint GLASS_BOUNCE_HEADROOM = 6u;
+    // path-traced water medium state, see waterSigma()
+    bool inWater = p.waterParams.x > 0.5;
+    bool waterSinceDiffuse = false;  // refracted through a water surface since the last diffuse bounce
+    bool pathSpread = false;
+    vec3 misPos = vec3(0.0);
+    float misPdfBsdf = 0.0;
+    vec3 mediumSigma = inWater ? waterSigma(p.waterCamera.rgb, p.waterCamera.w) : vec3(0.0);
+    vec3 mediumScatter = inWater ? waterScatterRadiance(p.waterCamera.rgb) : vec3(0.0);
+    float mediumSurfaceZ = p.waterParams2.y;  // height of the surface the path's water was entered through
+    if (inWater) {
+        vec3 camDir = normalize(worldPos - cameraPos);
+        float camSeg = min(linearDist, waterPlaneT(cameraPos, camDir, mediumSurfaceZ));
+        vec3 T = exp(-mediumSigma * camSeg);
+        radiance = radiance * T + (vec3(1.0) - T) * mediumScatter;
+        radiance += waterVolumeInscatter(cameraPos, camDir, camSeg, mediumSigma, mediumSurfaceZ, seed);  // underwater volumetrics
+        throughput *= T;
+    }
+    for (uint bounce = 0u; bounce <= bounces + GLASS_BOUNCE_HEADROOM; ++bounce) {
+        PROF_LAP(bounce == 0u ? 8 : 12);
+        gBounce = bounce;
+        if (bounce == 3u) diagRadAtDeep = radiance;
+        if (curIsGlass && !curIsWater) {
+            if (!curEntering && !insideGlass) curEntering = true;
+        } else if (!curIsGlass && insideGlass && !glassMediumIsWater) {
+            throughput *= clamp(glassTint, vec3(0.02), vec3(1.0));
+            insideGlass = false;
+        }
+        if (bounce == 0u && !curIsGlass) gRayStat[15] += uint(clamp(luminance(curAlbedo), 0.0, 4.0) * 256.0);  // camera-seen albedo
+        curLmIrradiance = vec3(0.0);  // refilled by directLighting() for this vertex
+        vec3 V = -prevDir;
+
+        if (bounce == 1u) { gRayStat[16]++; if (rcOn && rcUpdatePath) gRayStat[18]++; }
+        if (rcOn && !curIsGlass && !curIsDynamic && !inWater) {
+            if (pathSpread && bounce >= (rcUpdatePath ? 2u : 1u)) {
+                vec3 jt, jb;
+                buildBasis(curNormal, jt, jb);
+                float cellHere = max(p.cacheParams.y, 0.25) * float(1 << clamp(int(floor(log2(max(length(curPos - cameraPos), 1.0) / 32.0))), 0, 10));
+                vec3 jp = curPos + (jt * (randFloat(seed) - 0.5) + jb * (randFloat(seed) - 0.5)) * cellHere;
+                uint s0, ck;
+                rcCell(jp, curNormal, cameraPos, s0, ck);
+                int sl = rcFind(s0, ck);
+                bool cacheOk = sl >= 0 && rcRadiance[sl].w >= p.cacheParams2.y && finite3(rcRadiance[sl].rgb);
+                if (!cacheOk && (uint(p.cacheParams2.w + 0.5) & 1u) != 0u) {
+                    rcCell(curPos, curNormal, cameraPos, s0, ck);
+                    sl = rcFind(s0, ck);
+                    cacheOk = sl >= 0 && rcRadiance[sl].w >= 1.0 && finite3(rcRadiance[sl].rgb);
+                }
+                if (cacheOk) {
+                    radiance += throughput * rcRadiance[sl].rgb / curDisplayToTransport;
+                    if (bounce == 1u) gRayStat[17]++;
+                    break;
+                }
+                if (bounce == 1u) gRayStat[19]++;
+            }
+            bool diffuseHere = curSpecIntensity * curSpecScale < 0.15 && curMetalness < 0.1 && curEnvRefl < 0.05 && (curRoughOverride < 0.0 || curRoughOverride > 0.6);
+            if (rcCount < 4u && (bounce > 0u || diffuseHere)) {
+                rcCell(curPos, curNormal, cameraPos, rcSlot[rcCount], rcCheck[rcCount]);
+                rcBefore[rcCount] = radiance;
+                rcT[rcCount] = throughput / curDisplayToTransport;  // stored as transport-albedo light
+                ++rcCount;
+            }
+        }
+
+        vec3 bounceDir;
+        vec3 throughputMul = vec3(1.0);
+        float pdfBsdf = 0.0;
+        // true whenever this bounce's new direction comes from a delta-like sampling strategy
+        bool sampledDelta = false;
+        // mirror-like continuations (glass/water, and glossy reflections close to the mirror
+        // direction) see sprites
+        bool spriteRay = false;
+
+        if (curIsGlass) {
+            // dielectric interface
+            if (bounce == bounces + GLASS_BOUNCE_HEADROOM) break;
+
+            if (curIsWater) {
+                // medium handled by inWater, below
+            } else if (curEntering) {
+                insideGlass = true;
+                glassMediumIsWater = curIsWater;
+                glassEntryPos = curPos;
+                glassTint = curAlbedo;
+                glassReferenceThickness = curIsWater
+                    ? curWaterRefThickness
+                    : GLASS_REFERENCE_THICKNESS * mix(1.0, 4.0, clamp(p.emissiveImportancePad.w, 0.0, 1.0));
+            } else if (insideGlass) {
+                // colored absorption
+                float dist = length(curPos - glassEntryPos);
+                vec3 safeTint = clamp(glassTint, vec3(0.02), vec3(1.0));
+                vec3 transmittance = glassMediumIsWater
+                    ? mix(vec3(1.0), safeTint, clamp(dist / glassReferenceThickness, 0.0, 1.0))
+                    : safeTint;
+                throughput *= transmittance;
+                insideGlass = false;
+            }
+
+            // same dielectric BSDF, selected per-hit IOR
+            if (curIsWater && curEntering && bounce == 0u) {
+                // path-traced water, the surface the camera sees
+                float F = fresnelDielectric(clamp(dot(-prevDir, curNormal), 0.0, 1.0), 1.0, IOR_WATER);
+                radiance += throughput * F * waterReflectionRadiance(curPos, reflect(prevDir, curNormal), seed);
+                vec3 T = refract(prevDir, curNormal, 1.0 / IOR_WATER);
+                if (dot(T, T) < 0.5) break;
+                bounceDir = T;
+                throughput *= (1.0 - F);
+            } else {
+                bounceDir = sampleGlassBsdf(curNormal, prevDir, curEntering, curIsWater ? IOR_WATER : IOR_GLASS, throughput, seed, curIsWater);
+            }
+            sampledDelta = true;
+            if (curIsWater) waterSinceDiffuse = true;
+            spriteRay = true;
+            // a ray that went through the surface (not reflected) is now in water if it entered, out
+            // if it left
+            if (curIsWater && dot(bounceDir, curNormal) < 0.0) {
+                inWater = curEntering;
+                if (inWater) { mediumSigma = waterSigma(curAlbedo, curWaterRefThickness); mediumScatter = waterScatterRadiance(curAlbedo); mediumSurfaceZ = curPos.z; }
+            }
+        } else {
+            if (insideGlass) {
+                // same linear "blend toward the tint color, capped" formula as the paired-exit-hit
+                // case above
+                float dist = length(curPos - glassEntryPos);
+                vec3 safeTint = clamp(glassTint, vec3(0.02), vec3(1.0));
+                vec3 transmittance = glassMediumIsWater
+                    ? mix(vec3(1.0), safeTint, clamp(dist / glassReferenceThickness, 0.0, 1.0))
+                    : safeTint;
+                throughput *= transmittance;
+                insideGlass = false;
+            }
+
+            // scales the raw spec-alpha sample by this material's specscale tuning knob before mapping
+            // to roughness
+            float curRoughness = surfaceRoughness(curSpecIntensity * curSpecScale, curRoughOverride);
+            // a metal reads as "metal" almost entirely through glossy/sharp reflections
+            curRoughness = mix(curRoughness, min(curRoughness, 0.02), curMetalness);
+            // metallic-workflow F0
+            vec3 curF0 = mix(DIELECTRIC_F0, curAlbedo, curMetalness);
+            // model env-reflect mask (see gHitEnvRefl)
+            curF0 = mix(curF0, vec3(1.0), curEnvRefl);
+            gSpecWeight = ((curSpecIntensity * curSpecScale > 0.001 || curMetalness > 0.001 || curRoughOverride >= 0.0) ? 1.0 : clamp(p.skyRotationPad.w, 0.0, 1.0)) * curSpecWeight;
+
+            if (dot(throughput, throughput) > 1e-10) {
+                gShadeSelfEmitter = curEmissiveModel;
+                gShadeGrass = curIsGrass;
+                gCausticGatherHere = p.causticParams.x > 0.5 && deltaChain;  // == the gatherCaustics() condition below
+                gShadowWaterSigma = inWater ? mediumSigma : vec3(0.0);  // shadow rays from underwater
+                gShadowWaterSurfaceZ = mediumSurfaceZ;
+                gNoContinuation = bounce >= bounces;  // see gNoContinuation
+                PROF_LAP(bounce == 0u ? 9 : 10);
+                if (ptCut == 3u) break;  // stop before the camera hit's direct light
+                radiance += throughput * directLighting(curPos, curNormal, V, curAlbedo, curF0, curRoughness, curMetalness, seed, curLmIrradiance);
+                PROF_LAP(bounce == 0u ? 2 : 3);
+                if (ptCut == 2u || ptCut >= 4u) break;  // see ptCut
+                gNoContinuation = false;
+                gShadowWaterSigma = vec3(0.0);
+                gShadeSelfEmitter = false;
+                gShadeGrass = false;
+                // gathered at the camera's first diffuse vertex, directly seen or through glass
+                // (deltaChain), see caustics
+                if (p.causticParams.x > 0.5 && deltaChain)
+                {
+                    PROF_LAP(11);
+                    radiance += throughput * curAlbedo * ((1.0 - curMetalness) / PI) * gatherCaustics(curPos, curNormal);
+                    gCausticGatherHere = false;
+                    PROF_LAP(6);
+                }
+            }
+            if (bounce >= bounces) break;
+
+            bounceDir = sampleBsdfDirection(curNormal, V, curAlbedo, curF0, curRoughness, curMetalness, seed, throughputMul, pdfBsdf);
+            waterSinceDiffuse = false;
+            if (pdfBsdf <= 1e-8 || dot(throughputMul, throughputMul) <= 0.0) break;
+            spriteRay = curRoughness < 0.3 && dot(bounceDir, reflect(prevDir, curNormal)) > 0.97;
+            if (!spriteRay) pathSpread = true;
+            misPos = curPos;
+            misPdfBsdf = pdfBsdf;
+        }
+
+        // Russian roulette path termination
+        if (bounce == 0u && !curIsGlass) {
+            // light blocked by the parallax bumps isn't gone, it bounces off the bump wall
+            float v = pomDirVisibility(bounceDir);
+            throughputMul *= mix(curAlbedo, vec3(1.0), v);
+        }
+        {
+            const uint ROULETTE_MIN_BOUNCE = 3u;
+            if (bounce >= ROULETTE_MIN_BOUNCE) {
+                vec3 prospective = curIsGlass ? throughput : (throughput * throughputMul);
+                float survivalProb = clamp(max(prospective.r, max(prospective.g, prospective.b)), 0.05, 1.0);
+                if (randFloat(seed) > survivalProb) break;
+                if (curIsGlass) throughput /= survivalProb;
+                else throughputMul /= survivalProb;
+            }
+        }
+
+        // offset along bounceDir itself, not curNormal
+        const float waterSelfSkip = (curIsGlass && curIsWater) ? 0.25 : 0.0;
+        vec3 origin = curPos + bounceDir * 0.02;
+
+        rayQueryEXT rq;
+        gRayStat[6]++;
+        PROF_LAP(11);
+        const bool spritesOn = spriteRay && p.particleParams.x > 0.0 && p.particleParams.y > 0.5;
+        rayQueryInitializeEXT(rq, uTlas, 0u, RAYMASK_WORLD, origin, 0.0015, bounceDir, 4096.0);
+        while (rayQueryProceedEXT(rq)) {
+            if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue; if (waterPatchHides(rq)) continue;  // displaced water patch
+            bool alphaTestPassed;
+            MaterialEntry unusedCandidateEntry;
+            if (resolveAlphaTestCandidate(rq, alphaTestPassed, unusedCandidateEntry)) {
+                if (alphaTestPassed) rayQueryConfirmIntersectionEXT(rq);
+                continue;
+            }
+            if (rayQueryGetIntersectionTEXT(rq, false) < waterSelfSkip) continue;
+            rayQueryConfirmIntersectionEXT(rq);
+        }
+
+        // sprites passed in front of whatever this ray hit
+        if (spritesOn) {
+            const bool missed = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT;
+            radiance += throughput * (sampledDelta ? vec3(1.0) : throughputMul) * spritesAlong(origin, bounceDir, 0.0015, missed ? 4096.0 : rayQueryGetIntersectionTEXT(rq, true));
+        }
+#ifdef PT_SER
+        const uint serMaterial = rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT
+            ? 0u : uint(rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true));
+#endif
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            PROF_LAP(4);
+            if (inWater) {
+                // an underwater ray that never reaches a surface quad
+                float tOut = waterPlaneT(curPos, bounceDir, mediumSurfaceZ);
+                if (waterDebug.x < 0.0) waterDebug = tOut > 1e29 ? vec3(1.0, 0.0, 1.0) : vec3(1.0, 1.0, 0.0);  // missed
+                vec3 w = throughput * (sampledDelta ? vec3(1.0) : throughputMul);
+                if (bounce <= 1u) radiance += w * waterVolumeInscatter(curPos, bounceDir, tOut, mediumSigma, mediumSurfaceZ, seed);  // underwater volumetrics
+                if (tOut > 1e29) { radiance += w * mediumScatter; break; }
+                vec3 T = exp(-mediumSigma * tOut);
+                radiance += w * (vec3(1.0) - T) * mediumScatter;
+                throughput *= T;
+                inWater = false;
+            }
+            if (bounce == 0u) primaryEscapedToSky = true;
+            // an escaping ray sees the sky
+            bool viewThroughGlass = deltaChain && sampledDelta;
+            // the BSDF-sampling half of the sky's MIS pair (a delta/glass pick has no NEE partner and
+            // takes full weight)
+            bool skyboxLight = !viewThroughGlass && skyLightActive();
+            vec3 skyL = viewThroughGlass ? sampleRealSky(bounceDir) : (skyboxLight ? skyLightRadianceSkybox(bounceDir) : skyLightRadiance(bounceDir));
+            if (skyboxLight && !sampledDelta) {
+                float pdfSky = skyPdf(bounceDir);
+                skyL *= pdfBsdf / max(pdfBsdf + pdfSky, 1e-10);
+            }
+            if (viewThroughGlass && !glassFogDone) { glassFogDist = 1e6; glassFogDone = true; }  // escaped
+            if (!skyboxLight && !sampledDelta && p.skyRotationPad.z > 0.5 && dot(p.skyAmbientPad.xyz, p.skyAmbientPad.xyz) > 0.0) {
+                vec3 skyLevel = max(p.skyAmbientPad.xyz, vec3(1e-4));
+                skyL *= clamp(vec3(1.0) - curLmIrradiance / skyLevel, 0.0, 1.0);
+            }
+            radiance += throughput * (sampledDelta ? vec3(1.0) : throughputMul) * skyL;
+            // BSDF-sampling side of the sun's MIS pair
+            if (dot(p.sunColorPad.xyz, p.sunColorPad.xyz) > 0.0) {
+                vec3 sunDirBase = normalize(-p.sunDirectionRadius.xyz);
+                float sunAngularRadius = max(p.sunDirectionRadius.w, 1e-4);
+                float cosHalf = cos(sunAngularRadius);
+                if (dot(bounceDir, sunDirBase) >= cosHalf) {
+                    float solidAngle = max(PI * sunAngularRadius * sunAngularRadius, 1e-8);
+                    vec3 sunRadiance = p.sunColorPad.xyz / solidAngle;
+                    if (sampledDelta) {
+                        if (!(p.causticParams.x > 0.5 && !deltaChain && waterSinceDiffuse))
+                            radiance += throughput * sunRadiance * SAUER_LIGHTMAP_OVERBRIGHT * SAUER_BRDF_PI_COMPENSATION;
+                    } else {
+                        float pdfLight = 1.0 / solidAngle;
+                        float misWeight = pdfBsdf / max(pdfLight + pdfBsdf, 1e-10);
+                        radiance += throughput * throughputMul * sunRadiance * SAUER_LIGHTMAP_OVERBRIGHT * SAUER_BRDF_PI_COMPENSATION * misWeight;
+                    }
+                }
+            }
+            break;
+        }
+
+        vec3 hitPos, hitNormal, hitAlbedo, hitEmission;
+        float hitSpecIntensity, hitSpecScale, hitTriArea, hitMetalness;
+        bool hitIsGlass, hitIsWater, hitEntering;
+        // animated water
+        float hitWaterRefThickness;
+        float hitConeWidth;
+        PROF_LAP(4);
+        bool bounceFetched = fetchHitAttributes(rq, hitPos, hitNormal, hitAlbedo, hitSpecIntensity, hitSpecScale, hitEmission, hitTriArea, hitMetalness, hitIsGlass, hitIsWater, hitWaterRefThickness, hitEntering,
+                                 coneWidth, coneSpreadAngle, hitConeWidth);
+        PROF_LAP(5);
+        if (!bounceFetched) break;
+#if defined(PT_SER) && !defined(PT_SER_TOP)
+        // the bounce hit is fetched and its ray query is finished (misses already left the loop above)
+#ifdef PT_SER_ONCE
+        if (bounce == 0u) {  // one cheap reorder, first bounce hit only
+            SER_REORDER((rcUpdatePath ? 2u : 0u) | ((hitIsGlass || hitIsWater) ? 1u : 0u), 2u);
+        }
+#else
+        {
+            uint serHint = hitIsGlass ? 1u : (hitIsWater ? 2u : 3u + (serMaterial & 3u));
+            if (rcUpdatePath) serHint |= 8u;
+            SER_REORDER(serHint, 4u);
+        }
+#endif
+#endif
+        float hitEnvRefl = gHitEnvRefl;
+        float hitRoughOverride = gHitRoughOverride;
+        float hitSpecWeight = gHitSpecWeight;
+        bool hitEmissiveModel = gHitModelEmission;
+        bool hitIsGrass = gHitIsGrass;
+        bool hitIsDynamicInst = gHitIsDynamic;
+        float hitLavaGlow = gHitLavaGlow;  // path-traced lava
+        if (!hitIsGlass) { gRayStat[11] += uint(clamp(luminance(hitAlbedo), 0.0, 4.0) * 256.0); gRayStat[12]++; }
+
+        if (!sampledDelta) throughput *= throughputMul;
+        if (inWater) {
+            float segLen = length(hitPos - curPos);
+            float tOut = waterPlaneT(curPos, bounceDir, mediumSurfaceZ);
+            if (waterDebug.x < 0.0) waterDebug = vec3(clamp(segLen / 32.0, 0.0, 1.0), clamp(hitNormal.z, 0.0, 1.0), tOut < segLen ? 1.0 : 0.0);
+            vec3 T = exp(-mediumSigma * min(segLen, tOut));
+            radiance += throughput * (vec3(1.0) - T) * mediumScatter;
+            if (bounce <= 1u) radiance += throughput * waterVolumeInscatter(curPos, bounceDir, min(segLen, tOut), mediumSigma, mediumSurfaceZ, seed);  // underwater volumetrics
+            throughput *= T;
+            if (tOut < segLen && !hitIsWater) inWater = false;
+        }
+
+        // BSDF-sampling side of the emissive-triangle MIS pair
+        if (hitTriArea > 1e-8 && dot(hitEmission, hitEmission) > 0.0) {
+            uint emissiveCountHere = uint(p.skyAmbientPad.w);
+            if (sampledDelta && !gHitModelEmission && misPdfBsdf > 0.0 && emissiveCountHere > 0u && p.emissiveImportancePad.x > 1e-8) {
+                vec3 d = hitPos - misPos;
+                float dist2 = max(dot(d, d), 1e-8);
+                float cosThetaLight = max(abs(dot(hitNormal, d * inversesqrt(dist2))), 1e-5);
+                float lumUnscaled = luminance(hitEmission) / max(p.ambientFloorPad.w, 1e-6);
+                if (hitLavaGlow > 0.0) lumUnscaled = hitLavaGlow * luminance(LAVA_NOMINAL);
+                float pdfLight = lumUnscaled * dist2 / max(p.emissiveImportancePad.x * cosThetaLight, 1e-8);
+                radiance += throughput * hitEmission * (misPdfBsdf / max(pdfLight + misPdfBsdf, 1e-10));
+            } else if (sampledDelta || gHitModelEmission) {  // model emission has no NEE partner, see gHitModelEmission
+                radiance += throughput * hitEmission;
+            } else {
+                uint emissiveCount = uint(p.skyAmbientPad.w);
+                if (emissiveCount > 0u && p.emissiveImportancePad.x > 1e-8) {
+                    float dist = length(hitPos - curPos);
+                    float cosThetaLight = max(abs(dot(hitNormal, bounceDir)), 1e-5);
+                    float glowScaleSafe = max(p.ambientFloorPad.w, 1e-6);
+                    float lumUnscaled = luminance(hitEmission) / glowScaleSafe;
+                    if (hitLavaGlow > 0.0) lumUnscaled = hitLavaGlow * luminance(LAVA_NOMINAL);  // NEE's selection weight
+                    float pdfLight = lumUnscaled * dist * dist / max(p.emissiveImportancePad.x * cosThetaLight, 1e-8);
+                    float misWeight = pdfBsdf / max(pdfLight + pdfBsdf, 1e-10);
+                    radiance += throughput * hitEmission * misWeight;
+                } else {
+                    // defensive
+                    radiance += throughput * hitEmission;
+                }
+            }
+        }
+
+        if (deltaChain && sampledDelta && !glassFogDone) {
+            glassFogDist += length(hitPos - curPos);
+            if (!hitIsGlass) { glassFogDone = true; floorAlbedo = throughput * hitAlbedo; }
+        }
+        // the primary is a model mirror and this bounce is its mirror reflection
+        if (bounce == 0u && primaryEnvRefl > 0.0 && !primaryIsGlass && !hitIsGlass &&
+            dot(bounceDir, reflect(prevDir, curNormal)) > 0.98) {
+            floorAlbedo += throughput * hitAlbedo;
+        }
+        if (!sampledDelta) deltaChain = false;
+        // the hit is still camera-seen only through delta (glass/water) or mirror-like reflections
+        {
+            bool mirrorLike = !sampledDelta && !curIsGlass && dot(bounceDir, reflect(prevDir, curNormal)) > 0.995 &&
+                (curEnvRefl > 0.0 || curMetalness > 0.5 || surfaceRoughness(curSpecIntensity * curSpecScale, curRoughOverride) < 0.3);
+            viewChain = viewChain && (sampledDelta || mirrorLike);
+            vec3 ratio = vec3(1.0);
+            if (!hitIsGlass) {
+                vec3 tA = transportAlbedo(hitAlbedo);
+                if (viewChain) ratio = displayToTransportRatio(hitAlbedo);
+                else hitAlbedo = tA;
+            }
+            curDisplayToTransport = ratio;
+        }
+        curPos = hitPos;
+        curNormal = hitNormal;
+        curAlbedo = hitAlbedo;
+        curSpecIntensity = hitSpecIntensity;
+        curSpecScale = hitSpecScale;
+        curMetalness = hitMetalness;
+        curEnvRefl = hitEnvRefl;
+        curRoughOverride = hitRoughOverride;
+        curSpecWeight = hitSpecWeight;
+        curEmissiveModel = hitEmissiveModel;
+        curIsGrass = hitIsGrass;
+        curIsDynamic = hitIsDynamicInst;
+        curIsGlass = hitIsGlass;
+        // animated water
+        curIsWater = hitIsWater;
+        curWaterRefThickness = hitWaterRefThickness;
+        curEntering = hitEntering;
+        prevDir = bounceDir;
+        coneWidth = hitConeWidth;  // carried forward as next bounce's own starting width
+    }
+
+    PROF_LAP(13);
+    gRayStat[13] += uint(clamp(luminance(radiance), 0.0, 64.0) * 256.0);
+    if (diagRadAtDeep.x >= 0.0) gRayStat[14] += uint(clamp(luminance(radiance - diagRadAtDeep), 0.0, 64.0) * 256.0);
+    // write back each recorded vertex's outgoing light
+    for (uint k = 0u; k < rcCount; ++k) {
+        if (any(lessThan(rcT[k], vec3(1e-3)))) continue;
+        vec3 Lk = (radiance - rcBefore[k]) / rcT[k];
+        if (!finite3(Lk)) continue;  // never let a bad sample into a cell
+        Lk = clamp(Lk, vec3(0.0), vec3(32.0));
+        int sl = rcInsert(rcSlot[k], rcCheck[k]);
+        if (sl < 0) continue;
+        atomicAdd(rcAccum[sl].x, uint(Lk.r * RC_SCALE));
+        atomicAdd(rcAccum[sl].y, uint(Lk.g * RC_SCALE));
+        atomicAdd(rcAccum[sl].z, uint(Lk.b * RC_SCALE));
+        atomicAdd(rcAccum[sl].w, 1u);
+    }
+    PROF_LAP(15);  // radiance-cache write-back
+    // the cache's bounced light replaces most of Sauerbraten's flat floor
+    vec3 floorValue = p.ambientFloorPad.xyz * (rcOn ? p.cacheParams2.x : 1.0);
+    radiance = max(radiance, floorAlbedo * floorValue * SAUER_LIGHTMAP_OVERBRIGHT);
+    radianceAccum += radiance;
+    if (sampleIdx == 0u && primaryIsGlass) fogLinearDist = glassFogDist;
+    PROF_LAP(16);  // floor / per-sample end
+    }  // samples-per-pixel loop
+    vec3 radiance = radianceAccum / float(sppCount);
+
+#if PATH_TRACE_DEBUG_METALNESS
+    radiance = vec3(metalness);
+#endif
+
+    float encodedDepth = primaryIsDynamic ? -rawDepth : rawDepth;
+    if (!finite3(radiance)) radiance = vec3(0.0);
+    if (p.waterParams2.w > 0.5) radiance = waterDebug.x >= 0.0 ? waterDebug : radiance * 0.15;  // ptwaterdebug
+    imageStore(uRawRadiance, pixel, vec4(radiance, encodedDepth));
+    imageStore(uLinearDepthOut, pixel, vec4(fogLinearDist, specVirtualDist, 0.0, 0.0));
+    gRayStat[0]++;
+    PROF_LAP(14);
+    PROF_FINISH();
+    flushRayStats();
+}
+#else  // CAUSTIC_PHOTON_PASS, water caustic photons, see caustics
+// photons per batch (y = batch), placed by camera-importance (see causticAreaPdf)
+void main() {
+    uint N = causticPerBatch();
+    uint pid = gl_WorkGroupID.x * 64u + gl_LocalInvocationIndex;
+    uint batch = gl_WorkGroupID.y;
+    if (N == 0u || pid >= N || batch >= CAUSTIC_BATCHES) return;
+    gPixel = ivec2(0); gBounce = 0u; gSample = 0u;
+
+    vec3 cam = (p.invView * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+    uint frameSeed = pcgHash(p.frameData.x * 0x9E3779B9u ^ pcgHash(batch * 0x85EBCA6Bu + 0x2545F491u));
+    uint rotU = frameSeed, rotV = pcgHash(frameSeed);
+    vec2 u = vec2(float(pid * 0xC13FA9A9u + rotU), float(pid * 0x91E10DA5u + rotV)) * (1.0 / 4294967296.0);
+    float rr = CAUSTIC_NEAR * sqrt(max(exp(u.x * causticLnK()) - 1.0, 0.0));  // inverse CDF of the radial density
+    float th = 6.28318530718 * u.y;
+    vec2 xy = cam.xy + rr * vec2(cos(th), sin(th));
+    float photonArea = 1.0 / (float(N) * causticAreaPdf(rr));
+    uint seed = pcgHash(pid * 9781u ^ frameSeed);
+
+    rayQueryEXT wq;
+    rayQueryInitializeEXT(wq, uTlas, gl_RayFlagsCullOpaqueEXT, RAYMASK_WORLD, vec3(xy, cam.z + 2048.0), 0.0, vec3(0.0, 0.0, -1.0), 8192.0);
+    while (rayQueryProceedEXT(wq)) {
+        if (rayQueryGetIntersectionTypeEXT(wq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue; if (waterPatchHides(wq)) continue;  // displaced water patch
+        if (causticWaterCandidate(wq)) rayQueryConfirmIntersectionEXT(wq);
+    }
+    if (rayQueryGetIntersectionTypeEXT(wq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return;
+    vec3 g, gN, gAlbedo, gEm;
+    float gs, gss, gta, gm, gwt, gcw;
+    bool gg, gw, ge;
+    if (!fetchHitAttributes(wq, g, gN, gAlbedo, gs, gss, gEm, gta, gm, gg, gw, gwt, ge, 0.0, 0.0, gcw)) return;
+    if (!gw || !ge) return;  // a top surface, met from above
+
+    vec3 sunL = vec3(0.0);
+    float wSun = 0.0;
+    if (dot(p.sunColorPad.xyz, p.sunColorPad.xyz) > 0.0) {
+        vec3 sb = normalize(-p.sunDirectionRadius.xyz);
+        vec3 t, bt; buildBasis(sb, t, bt);
+        float ar = max(p.sunDirectionRadius.w, 0.0);
+        float rr = ar * sqrt(randFloat(seed)), th = 6.28318530718 * randFloat(seed);
+        sunL = normalize(sb + t * (rr * cos(th)) + bt * (rr * sin(th)));
+        wSun = luminance(p.sunColorPad.xyz) * max(sunL.z, 0.0);
+    }
+    uint lightCount = p.frameData.w;
+    LightList photonLights = lightListAt(g, lightCount);
+    uint photonLightCount = lightListSize(photonLights);
+    float W = wSun;
+    for (uint k = 0u; k < photonLightCount; ++k) {
+        uint li = lightListGet(photonLights, k);
+        if (li < lightCount && lights[li].posRadius.z > g.z) W += causticLightWeight(li, g, vec3(0.0, 0.0, 1.0));
+    }
+    if (W <= 0.0) return;
+    float pick = randFloat(seed) * W;
+    int chosen = -1;  // -1 = sun
+    vec3 L; float distToLight; vec3 lightColor;
+    float attenG = 1.0, lightRadius = 0.0;
+    bool noFalloff = true;
+    if (pick < wSun) {
+        L = sunL; distToLight = 4096.0; lightColor = p.sunColorPad.xyz;
+    } else {
+        float acc = wSun;
+        for (uint k = 0u; k < photonLightCount; ++k) {
+            uint li = lightListGet(photonLights, k);
+            float w = (li < lightCount && lights[li].posRadius.z > g.z) ? causticLightWeight(li, g, vec3(0.0, 0.0, 1.0)) : 0.0;
+            acc += w;
+            if (w > 0.0 && pick < acc) { chosen = int(li); break; }
+        }
+        if (chosen < 0) return;
+        vec3 tl = lightNearestPoint(lights[chosen].posRadius.xyz, lightHalfAxis(lights[chosen].colorFlags, lights[chosen].reserved), g) - g;
+        distToLight = length(tl); L = tl / distToLight;
+        lightColor = lights[chosen].colorFlags.xyz;
+        lightRadius = lights[chosen].posRadius.w;
+        noFalloff = (int(lights[chosen].colorFlags.w + 0.5) & 2) != 0;
+        attenG = noFalloff ? 1.0 : max(1.0 - distToLight / lightRadius, 0.0);
+    }
+    float lumC = luminance(lightColor);
+    if (lumC <= 0.0) return;
+    // flux onto the photon's area (horizontal, photonArea), directLighting() units
+    vec3 power = lightColor / lumC * (W * photonArea) * SAUER_LIGHTMAP_OVERBRIGHT * SAUER_BRDF_PI_COMPENSATION;
+
+    vec3 vis = traceShadowRayTinted(g + vec3(0.0, 0.0, 0.05), L, distToLight - 0.1);
+    if (dot(vis, vis) <= 0.0) return;
+    power *= vis;
+
+    vec3 n = waterWaveNormalAt(g.xy, p.waterFft, p.waterMap, waterAmp(), p.causticParams2.x);
+    if (p.waterParams.z <= 0.0) n = gN.z > 0.0 ? gN : -gN;
+    float F = fresnelDielectric(clamp(dot(L, n), 0.0, 1.0), 1.0, IOR_WATER);
+    vec3 T = refract(-L, n, 1.0 / IOR_WATER);
+    if (dot(T, T) < 0.5) return;
+    T = normalize(T);
+    power *= 1.0 - F;
+    rayQueryEXT rq;
+    rayQueryInitializeEXT(rq, uTlas, 0u, RAYMASK_WORLD, g + T * 0.02, 0.0015, T, 8192.0);
+    while (rayQueryProceedEXT(rq)) {
+        if (rayQueryGetIntersectionTypeEXT(rq, false) != gl_RayQueryCandidateIntersectionTriangleEXT) continue; if (waterPatchHides(rq)) continue;  // displaced water patch
+        bool passed; MaterialEntry unusedEntry;
+        if (resolveAlphaTestCandidate(rq, passed, unusedEntry)) { if (passed) rayQueryConfirmIntersectionEXT(rq); continue; }
+        rayQueryConfirmIntersectionEXT(rq);  // glass/water
+    }
+    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) return;
+    vec3 hitPos, hitN, hitAlbedo, hitEmission;
+    float hs, hss, hta, hm, hwt, hcw;
+    bool hg, hw, he;
+    if (!fetchHitAttributes(rq, hitPos, hitN, hitAlbedo, hs, hss, hitEmission, hta, hm, hg, hw, hwt, he, 0.0, 0.0, hcw)) return;
+    if (hw || hg) return;  // out through another surface
+    float seg = length(hitPos - g);
+    power *= exp(-waterSigma(gAlbedo, gwt) * seg);
+    if (chosen >= 0 && !noFalloff) power *= max(1.0 - (distToLight + seg) / lightRadius, 0.0) / max(attenG, 1e-4);
+    power *= causticWindowWeight(hitPos);  // the window's fade, the shadow rays carry the rest
+    if (luminance(power) <= 1e-8) return;
+    uint local = atomicAdd(causticHeader[batch].x, 1u);
+    if (local >= N) return;
+    uint idx = batch * N + local;
+    uint level = causticLevelOf(length(hitPos.xy - cam.xy));
+    ivec3 hc = ivec3(floor(hitPos / causticCellSizeL(level)));
+    uint prev = atomicExchange(causticHeads[batch * causticHashSize() + causticHashL(hc, level)], idx);
+    causticPhotons[idx].posNext = vec4(hitPos, uintBitsToFloat(prev));
+    causticPhotons[idx].powerKey = vec4(power, uintBitsToFloat(causticKeyL(hc, level)));
+    causticPhotons[idx].normal = vec4(hitN, 0.0);
+}
+#endif

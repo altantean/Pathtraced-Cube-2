@@ -1,0 +1,144 @@
+#version 460
+#extension GL_EXT_buffer_reference2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct SkinSourceVertex {
+    float px, py, pz;
+    float nx, ny, nz;
+    float tx, ty, tz, tw;
+    float u, v;
+    uint blendBone0, blendBone1, blendBone2, blendBone3;
+    float blendWeight0, blendWeight1, blendWeight2, blendWeight3;
+    uint textureIndex;
+    uint materialIndex;
+};
+
+struct ChunkRtVertexGpu {
+    float px, py, pz;
+    float nx, ny, nz;
+    float tx, ty, tz, tw;
+    float u, v;
+    uint textureIndex;
+    uint materialIndex;
+    uint blendMaterialIndex;
+    float blendAlpha;
+    float blendU, blendV;
+    // Sauerbraten skin::alphatest cutout support
+    float alphaTestCutoff;
+    // per-pixel texture-blend source (world chunks only)
+    float blendLmU, blendLmV;
+    uint blendLmTexIndex;
+};
+
+// one bone's current-frame transform, as a dual quaternion (and dual part, each a vec4)
+struct BoneDualQuat {
+    vec4 real;
+    vec4 dual;
+};
+
+layout(std430, binding = 0) readonly buffer SkinSourceBuf { SkinSourceVertex v[]; } skinSource;
+layout(std430, binding = 1) readonly buffer BoneBuf { BoneDualQuat b[]; } bones;
+layout(std430, binding = 2) writeonly buffer OutputBuf { ChunkRtVertexGpu v[]; } outVerts;
+
+layout(std140, binding = 3) uniform SkinParams {
+    vec4 worldRow0;
+    vec4 worldRow1;
+    vec4 worldRow2;
+    uint vertexCount;
+} params;
+
+BoneDualQuat blendBones(SkinSourceVertex v) {
+    BoneDualQuat d;
+    d.real = bones.b[v.blendBone0].real * v.blendWeight0;
+    d.dual = bones.b[v.blendBone0].dual * v.blendWeight0;
+
+    {
+        BoneDualQuat term = bones.b[v.blendBone1];
+        float k = v.blendWeight1;
+        if (dot(d.real, term.real) < 0.0) k = -k;
+        d.real += term.real * k;
+        d.dual += term.dual * k;
+    }
+    // bones 2/3 only accumulated when (matches blendbones()'s own `if(c.weights[2])` gate)
+    if (v.blendWeight2 > 0.0) {
+        BoneDualQuat term = bones.b[v.blendBone2];
+        float k = v.blendWeight2;
+        if (dot(d.real, term.real) < 0.0) k = -k;
+        d.real += term.real * k;
+        d.dual += term.dual * k;
+        if (v.blendWeight3 > 0.0) {
+            BoneDualQuat term2 = bones.b[v.blendBone3];
+            float k2 = v.blendWeight3;
+            if (dot(d.real, term2.real) < 0.0) k2 = -k2;
+            d.real += term2.real * k2;
+            d.dual += term2.dual * k2;
+        }
+    }
+    return d;
+}
+
+void normalizeDualQuat(inout BoneDualQuat d) {
+    float len = length(d.real);
+    if (len > 1e-8) { d.real /= len; d.dual /= len; }
+}
+
+vec3 dqTransformPoint(BoneDualQuat d, vec3 p) {
+    vec3 qv = d.real.xyz;
+    float qw = d.real.w;
+    vec3 rotated = p + 2.0 * cross(qv, cross(qv, p) + qw * p);
+    vec3 t = 2.0 * (qw * d.dual.xyz - d.dual.w * qv + cross(qv, d.dual.xyz));
+    return rotated + t;
+}
+
+vec3 dqTransformNormal(BoneDualQuat d, vec3 n) {
+    vec3 qv = d.real.xyz;
+    float qw = d.real.w;
+    return n + 2.0 * cross(qv, cross(qv, n) + qw * n);
+}
+
+vec3 applyWorldMatrix(vec3 p) {
+    return vec3(dot(params.worldRow0.xyz, p) + params.worldRow0.w,
+                dot(params.worldRow1.xyz, p) + params.worldRow1.w,
+                dot(params.worldRow2.xyz, p) + params.worldRow2.w);
+}
+
+vec3 applyWorldMatrixNormal(vec3 n) {
+    return vec3(dot(params.worldRow0.xyz, n), dot(params.worldRow1.xyz, n), dot(params.worldRow2.xyz, n));
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.vertexCount) return;
+
+    SkinSourceVertex src = skinSource.v[idx];
+    BoneDualQuat blended = blendBones(src);
+    normalizeDualQuat(blended);
+
+    vec3 localPos = dqTransformPoint(blended, vec3(src.px, src.py, src.pz));
+    vec3 localNormal = dqTransformNormal(blended, vec3(src.nx, src.ny, src.nz));
+    vec3 localTangent = dqTransformNormal(blended, vec3(src.tx, src.ty, src.tz));
+
+    vec3 worldPos = applyWorldMatrix(localPos);
+    vec3 worldNormal = normalize(applyWorldMatrixNormal(localNormal));
+    vec3 worldTangent = normalize(applyWorldMatrixNormal(localTangent));
+
+    ChunkRtVertexGpu o;
+    o.px = worldPos.x; o.py = worldPos.y; o.pz = worldPos.z;
+    o.nx = worldNormal.x; o.ny = worldNormal.y; o.nz = worldNormal.z;
+    o.tx = worldTangent.x; o.ty = worldTangent.y; o.tz = worldTangent.z; o.tw = src.tw;
+    o.u = src.u; o.v = src.v;
+    o.textureIndex = src.textureIndex;
+    o.materialIndex = src.materialIndex;
+    o.blendMaterialIndex = 0xFFFFFFFFu;
+    o.blendAlpha = 0.0;
+    o.blendU = 0.0; o.blendV = 0.0;
+    // "no test" default
+    o.alphaTestCutoff = 0.0;
+    o.blendLmU = 0.0;
+    o.blendLmV = 0.0;
+    o.blendLmTexIndex = 0u;
+    outVerts.v[idx] = o;
+}

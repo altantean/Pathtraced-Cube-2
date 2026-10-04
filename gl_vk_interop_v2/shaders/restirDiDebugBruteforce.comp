@@ -1,0 +1,149 @@
+#version 460
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct LightRecord
+{
+    vec4 positionAndRadius;
+    vec4 positionEndAndRange;
+    vec4 colorAndType;
+    vec4 radianceOrReserved;
+};
+
+layout(set = 0, binding = 3, std140) uniform Params
+{
+    mat4 invViewProj;
+    mat4 invView;
+    uvec4 frameData;
+} p;
+
+layout(set = 0, binding = 4, std430) readonly buffer LightBuffer
+{
+    LightRecord lights[];
+} _207;
+
+layout(set = 0, binding = 0) uniform sampler2D uDepth;
+layout(set = 0, binding = 1) uniform sampler2D uNormalRoughness;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D uOutput;
+
+vec3 closestPointOnSegment(vec3 point, vec3 a, vec3 b)
+{
+    vec3 ab = b - a;
+    float abLenSq = dot(ab, ab);
+    if (abLenSq < 9.9999999392252902907785028219223e-09)
+    {
+        return a;
+    }
+    float t = clamp(dot(point - a, ab) / abLenSq, 0.0, 1.0);
+    return a + (ab * t);
+}
+
+void main()
+{
+    uvec2 pix = gl_GlobalInvocationID.xy;
+    bool _75 = pix.x >= p.frameData.y;
+    bool _85;
+    if (!_75)
+    {
+        _85 = pix.y >= p.frameData.z;
+    }
+    else
+    {
+        _85 = _75;
+    }
+    if (_85)
+    {
+        return;
+    }
+    ivec2 ipix = ivec2(pix);
+    vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(float(p.frameData.y), float(p.frameData.z));
+    float depth = texelFetch(uDepth, ipix, 0).x;
+    vec3 nView = texelFetch(uNormalRoughness, ipix, 0).xyz;
+    bool _130 = depth >= 0.999998986721038818359375;
+    bool _139;
+    if (!_130)
+    {
+        _139 = dot(nView, nView) < 9.9999999747524270787835121154785e-07;
+    }
+    else
+    {
+        _139 = _130;
+    }
+    if (_139)
+    {
+        imageStore(uOutput, ipix, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    vec4 clip = vec4((uv * 2.0) - vec2(1.0), (depth * 2.0) - 1.0, 1.0);
+    vec4 worldH = p.invViewProj * clip;
+    vec3 worldPos = worldH.xyz / vec3(worldH.w);
+    vec3 nWorld = normalize((p.invView * vec4(nView, 0.0)).xyz);
+    vec3 sum = vec3(0.0);
+    uint count = p.frameData.w;
+    for (uint i = 0u; i < count; i++)
+    {
+        float type = _207.lights[i].colorAndType.w;
+        if (type < 0.5)
+        {
+            vec3 lightPos = _207.lights[i].positionAndRadius.xyz;
+            float lightRadius = _207.lights[i].positionAndRadius.w;
+            vec3 lightPosEnd = _207.lights[i].positionEndAndRange.xyz;
+            float lightRange = _207.lights[i].positionEndAndRange.w;
+            vec3 lightColor = _207.lights[i].colorAndType.xyz;
+            if (lightRange <= 0.0)
+            {
+                continue;
+            }
+            vec3 param = worldPos;
+            vec3 param_1 = lightPos;
+            vec3 param_2 = lightPosEnd;
+            vec3 closest = closestPointOnSegment(param, param_1, param_2);
+            vec3 toLight = closest - worldPos;
+            float rawDist = max(length(toLight), 9.9999997473787516355514526367188e-05);
+            vec3 L = toLight / vec3(rawDist);
+            float dist = max(rawDist - lightRadius, 9.9999997473787516355514526367188e-05);
+            if (dist >= lightRange)
+            {
+                continue;
+            }
+            float NoL = max(dot(nWorld, L), 0.0);
+            if (NoL <= 0.0)
+            {
+                continue;
+            }
+            float rangeWindow = clamp(1.0 - pow(dist / lightRange, 4.0), 0.0, 1.0);
+            float attenuation = (rangeWindow * rangeWindow) / ((dist * dist) + 1.0);
+            sum += ((lightColor * NoL) * attenuation);
+        }
+        else
+        {
+            vec3 v0 = _207.lights[i].positionAndRadius.xyz;
+            vec3 v1 = _207.lights[i].positionEndAndRange.xyz;
+            vec3 v2 = _207.lights[i].colorAndType.xyz;
+            vec3 radiance = _207.lights[i].radianceOrReserved.xyz;
+            vec3 e1 = v1 - v0;
+            vec3 e2 = v2 - v0;
+            vec3 cr = cross(e1, e2);
+            float doubleArea = length(cr);
+            if (doubleArea < 9.9999999392252902907785028219223e-09)
+            {
+                continue;
+            }
+            vec3 nLight = cr / vec3(doubleArea);
+            float area = doubleArea * 0.5;
+            vec3 triCentroid = ((v0 + v1) + v2) / vec3(3.0);
+            vec3 toLight_1 = triCentroid - worldPos;
+            float dist_1 = max(length(toLight_1), 9.9999997473787516355514526367188e-05);
+            vec3 L_1 = toLight_1 / vec3(dist_1);
+            float NoLSurface = max(dot(nWorld, L_1), 0.0);
+            float NoLLight = max(dot(nLight, -L_1), 0.0);
+            if ((NoLSurface <= 0.0) || (NoLLight <= 0.0))
+            {
+                continue;
+            }
+            sum += ((((radiance * NoLSurface) * NoLLight) * area) / vec3((dist_1 * dist_1) + 1.0));
+        }
+    }
+    imageStore(uOutput, ipix, vec4(sum, 1.0));
+}
+

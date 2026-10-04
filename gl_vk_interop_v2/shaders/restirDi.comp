@@ -1,0 +1,467 @@
+#version 460
+#extension GL_EXT_ray_query : require
+#extension GL_EXT_samplerless_texture_functions : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+struct LightRecord
+{
+    vec4 positionAndRadius;
+    vec4 positionEndAndRange;
+    vec4 colorAndType;
+    vec4 radianceOrReserved;
+};
+
+layout(set = 0, binding = 3, std430) readonly buffer LightBuffer
+{
+    LightRecord lights[];
+} _157;
+
+layout(set = 0, binding = 4, std140) uniform Params
+{
+    mat4 invViewProj;
+    mat4 invView;
+    uvec4 frameData;
+    uint candidateCount;
+    float bias;
+    float maxRayDistance;
+    float pad0;
+    mat4 previousViewProj;
+    float maxHistoryM;
+    float depthRejectThreshold;
+    float pad1;
+    float pad2;
+} p;
+
+layout(set = 0, binding = 2) uniform accelerationStructureEXT uTLAS;
+layout(set = 0, binding = 0) uniform sampler2D uDepth;
+layout(set = 0, binding = 1) uniform sampler2D uNormalRoughness;
+layout(set = 0, binding = 5, rgba16f) uniform writeonly image2D uOutput;
+layout(set = 0, binding = 6, rgba16f) uniform writeonly image2D uReservoirA;
+layout(set = 0, binding = 7, rgba32f) uniform writeonly image2D uReservoirB;
+layout(set = 0, binding = 10) uniform sampler2D uHistoryDepth;
+layout(set = 0, binding = 8) uniform sampler2D uHistoryReservoirA;
+layout(set = 0, binding = 9) uniform sampler2D uHistoryReservoirB;
+layout(set = 0, binding = 11) uniform sampler2D uHistoryNormalRoughness;
+
+rayQueryEXT q;
+
+uint hash(inout uvec2 x)
+{
+    x *= uvec2(1664525u, 1013904223u);
+    x ^= (x.yx >> uvec2(ivec2(16)));
+    x *= uvec2(2246822519u, 3266489917u);
+    x ^= (x.yx >> uvec2(ivec2(13)));
+    return x.x ^ x.y;
+}
+
+vec2 rand2(uvec2 pix, uint seed)
+{
+    uvec2 param = pix + uvec2(seed, seed * 2654435769u);
+    uint _103 = hash(param);
+    uint h = _103;
+    return vec2(float(h & 65535u), float(h >> uint(16))) / vec2(65535.0);
+}
+
+vec3 closestPointOnSegment(vec3 point, vec3 a, vec3 b)
+{
+    vec3 ab = b - a;
+    float abLenSq = dot(ab, ab);
+    if (abLenSq < 9.9999999392252902907785028219223e-09)
+    {
+        return a;
+    }
+    float t = clamp(dot(point - a, ab) / abLenSq, 0.0, 1.0);
+    return a + (ab * t);
+}
+
+float targetFunction(vec3 worldPos, vec3 nWorld, uint lightIndex, vec2 baryRandom, inout vec3 sampledPoint, inout vec3 unshadowedColor)
+{
+    float type = _157.lights[lightIndex].colorAndType.w;
+    if (type < 0.5)
+    {
+        vec3 lightPos = _157.lights[lightIndex].positionAndRadius.xyz;
+        float lightRadius = _157.lights[lightIndex].positionAndRadius.w;
+        vec3 lightPosEnd = _157.lights[lightIndex].positionEndAndRange.xyz;
+        float lightRange = _157.lights[lightIndex].positionEndAndRange.w;
+        vec3 lightColor = _157.lights[lightIndex].colorAndType.xyz;
+        vec3 param = worldPos;
+        vec3 param_1 = lightPos;
+        vec3 param_2 = lightPosEnd;
+        sampledPoint = closestPointOnSegment(param, param_1, param_2);
+        unshadowedColor = vec3(0.0);
+        if (lightRange <= 0.0)
+        {
+            return 0.0;
+        }
+        vec3 toLight = sampledPoint - worldPos;
+        float rawDist = max(length(toLight), 9.9999997473787516355514526367188e-05);
+        vec3 L = toLight / vec3(rawDist);
+        float dist = max(rawDist - lightRadius, 9.9999997473787516355514526367188e-05);
+        if (dist >= lightRange)
+        {
+            return 0.0;
+        }
+        float NoL = max(dot(nWorld, L), 0.0);
+        if (NoL <= 0.0)
+        {
+            return 0.0;
+        }
+        float rangeWindow = clamp(1.0 - pow(dist / lightRange, 4.0), 0.0, 1.0);
+        float attenuation = (rangeWindow * rangeWindow) / ((dist * dist) + 1.0);
+        unshadowedColor = (lightColor * NoL) * attenuation;
+        return dot(unshadowedColor, vec3(0.2125999927520751953125, 0.715200006961822509765625, 0.072200000286102294921875));
+    }
+    else
+    {
+        vec3 v0 = _157.lights[lightIndex].positionAndRadius.xyz;
+        vec3 v1 = _157.lights[lightIndex].positionEndAndRange.xyz;
+        vec3 v2 = _157.lights[lightIndex].colorAndType.xyz;
+        vec3 radiance = _157.lights[lightIndex].radianceOrReserved.xyz;
+        vec3 e1 = v1 - v0;
+        vec3 e2 = v2 - v0;
+        vec3 cr = cross(e1, e2);
+        float doubleArea = length(cr);
+        sampledPoint = v0;
+        unshadowedColor = vec3(0.0);
+        if (doubleArea < 9.9999999392252902907785028219223e-09)
+        {
+            return 0.0;
+        }
+        vec3 nLight = cr / vec3(doubleArea);
+        float area = doubleArea * 0.5;
+        float sqrtR1 = sqrt(baryRandom.x);
+        float b0 = sqrtR1 * (1.0 - baryRandom.y);
+        float b1 = sqrtR1 * baryRandom.y;
+        float b2 = 1.0 - sqrtR1;
+        sampledPoint = ((v0 * b0) + (v1 * b1)) + (v2 * b2);
+        vec3 toLight_1 = sampledPoint - worldPos;
+        float dist_1 = max(length(toLight_1), 9.9999997473787516355514526367188e-05);
+        vec3 L_1 = toLight_1 / vec3(dist_1);
+        float NoLSurface = max(dot(nWorld, L_1), 0.0);
+        float NoLLight = max(dot(nLight, -L_1), 0.0);
+        if ((NoLSurface <= 0.0) || (NoLLight <= 0.0))
+        {
+            return 0.0;
+        }
+        unshadowedColor = ((radiance * NoLSurface) * NoLLight) / vec3((dist_1 * dist_1) + 1.0);
+        return dot(unshadowedColor, vec3(0.2125999927520751953125, 0.715200006961822509765625, 0.072200000286102294921875)) * area;
+    }
+}
+
+float evaluateAtPoint(vec3 worldPos, vec3 nWorld, uint lightIndex, vec3 sampledPoint, inout vec3 unshadowedColor)
+{
+    float type = _157.lights[lightIndex].colorAndType.w;
+    vec3 toLight = sampledPoint - worldPos;
+    float dist = max(length(toLight), 9.9999997473787516355514526367188e-05);
+    vec3 L = toLight / vec3(dist);
+    float NoL = max(dot(nWorld, L), 0.0);
+    unshadowedColor = vec3(0.0);
+    if (NoL <= 0.0)
+    {
+        return 0.0;
+    }
+    if (type < 0.5)
+    {
+        float lightRadius = _157.lights[lightIndex].positionAndRadius.w;
+        float lightRange = _157.lights[lightIndex].positionEndAndRange.w;
+        vec3 lightColor = _157.lights[lightIndex].colorAndType.xyz;
+        if (lightRange <= 0.0)
+        {
+            return 0.0;
+        }
+        float adjustedDist = max(dist - lightRadius, 9.9999997473787516355514526367188e-05);
+        if (adjustedDist >= lightRange)
+        {
+            return 0.0;
+        }
+        float rangeWindow = clamp(1.0 - pow(adjustedDist / lightRange, 4.0), 0.0, 1.0);
+        float attenuation = (rangeWindow * rangeWindow) / ((adjustedDist * adjustedDist) + 1.0);
+        unshadowedColor = (lightColor * NoL) * attenuation;
+        return dot(unshadowedColor, vec3(0.2125999927520751953125, 0.715200006961822509765625, 0.072200000286102294921875));
+    }
+    else
+    {
+        vec3 v0 = _157.lights[lightIndex].positionAndRadius.xyz;
+        vec3 v1 = _157.lights[lightIndex].positionEndAndRange.xyz;
+        vec3 v2 = _157.lights[lightIndex].colorAndType.xyz;
+        vec3 radiance = _157.lights[lightIndex].radianceOrReserved.xyz;
+        vec3 e1 = v1 - v0;
+        vec3 e2 = v2 - v0;
+        vec3 cr = cross(e1, e2);
+        float doubleArea = length(cr);
+        if (doubleArea < 9.9999999392252902907785028219223e-09)
+        {
+            return 0.0;
+        }
+        vec3 nLight = cr / vec3(doubleArea);
+        float area = doubleArea * 0.5;
+        float NoLLight = max(dot(nLight, -L), 0.0);
+        if (NoLLight <= 0.0)
+        {
+            return 0.0;
+        }
+        unshadowedColor = ((radiance * NoL) * NoLLight) / vec3((dist * dist) + 1.0);
+        return dot(unshadowedColor, vec3(0.2125999927520751953125, 0.715200006961822509765625, 0.072200000286102294921875)) * area;
+    }
+}
+
+vec3 debugColor(int category)
+{
+    if (category == 0)
+    {
+        return vec3(0.0);
+    }
+    if (category == 1)
+    {
+        return vec3(0.0, 0.300000011920928955078125, 1.0);
+    }
+    if (category == 2)
+    {
+        return vec3(1.0, 0.0, 0.0);
+    }
+    if (category == 3)
+    {
+        return vec3(1.0, 0.85000002384185791015625, 0.0);
+    }
+    if (category == 4)
+    {
+        return vec3(0.0, 1.0, 1.0);
+    }
+    return vec3(0.0, 1.0, 0.0);
+}
+
+bool traceVisibility(vec3 worldPos, vec3 nWorld, vec3 targetPoint)
+{
+    vec3 toTarget = targetPoint - worldPos;
+    float dist = length(toTarget);
+    if (dist < 9.9999997473787516355514526367188e-05)
+    {
+        return true;
+    }
+    vec3 dir = toTarget / vec3(dist);
+    vec3 origin = worldPos + (nWorld * p.bias);
+    float maxDist = min(dist - (p.bias * 2.0), p.maxRayDistance);
+    if (maxDist <= 0.0)
+    {
+        return true;
+    }
+    rayQueryInitializeEXT(q, uTLAS, 5u, 255u, origin, 0.0, dir, maxDist);
+    for (;;)
+    {
+        bool _626 = rayQueryProceedEXT(q);
+        if (_626)
+        {
+            continue;
+        }
+        else
+        {
+            break;
+        }
+    }
+    uint _627 = rayQueryGetIntersectionTypeEXT(q, bool(1));
+    return _627 == 0u;
+}
+
+void main()
+{
+    uvec2 pix = gl_GlobalInvocationID.xy;
+    bool _676 = pix.x >= p.frameData.y;
+    bool _686;
+    if (!_676)
+    {
+        _686 = pix.y >= p.frameData.z;
+    }
+    else
+    {
+        _686 = _676;
+    }
+    if (_686)
+    {
+        return;
+    }
+    ivec2 ipix = ivec2(pix);
+    vec2 uv = (vec2(pix) + vec2(0.5)) / vec2(float(p.frameData.y), float(p.frameData.z));
+    float depth = texelFetch(uDepth, ipix, 0).x;
+    vec3 nView = texelFetch(uNormalRoughness, ipix, 0).xyz;
+    bool _726 = depth >= 0.999998986721038818359375;
+    bool _735;
+    if (!_726)
+    {
+        _735 = dot(nView, nView) < 9.9999999747524270787835121154785e-07;
+    }
+    else
+    {
+        _735 = _726;
+    }
+    if (_735)
+    {
+        imageStore(uOutput, ipix, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(uReservoirA, ipix, vec4(-1.0, 0.0, 0.0, 0.0));
+        imageStore(uReservoirB, ipix, vec4(0.0));
+        return;
+    }
+    vec4 clip = vec4((uv * 2.0) - vec2(1.0), (depth * 2.0) - 1.0, 1.0);
+    vec4 worldH = p.invViewProj * clip;
+    vec3 worldPos = worldH.xyz / vec3(worldH.w);
+    vec3 nWorld = normalize((p.invView * vec4(nView, 0.0)).xyz);
+    uint lightCount = p.frameData.w;
+    if (lightCount == 0u)
+    {
+        imageStore(uOutput, ipix, vec4(0.0, 0.0, 0.0, 1.0));
+        imageStore(uReservoirA, ipix, vec4(-1.0, 0.0, 0.0, 0.0));
+        imageStore(uReservoirB, ipix, vec4(0.0));
+        return;
+    }
+    uint candidates = clamp(p.candidateCount, 1u, 64u);
+    float wSum = 0.0;
+    int selectedIndex = -1;
+    vec3 selectedPoint = vec3(0.0);
+    vec3 selectedUnshadowedColor = vec3(0.0);
+    float selectedTargetPdf = 0.0;
+    vec3 param_8;
+    vec3 param_9;
+    for (uint i = 0u; i < candidates; i++)
+    {
+        uvec2 param = pix;
+        uint param_1 = ((p.frameData.x * 9781u) + (i * 6271u)) + 1u;
+        vec2 r = rand2(param, param_1);
+        uint lightIndex = min(uint(r.x * float(lightCount)), (lightCount - 1u));
+        uvec2 param_2 = pix;
+        uint param_3 = ((p.frameData.x * 5417u) + (i * 3491u)) + 2u;
+        vec2 bary = rand2(param_2, param_3);
+        vec3 param_4 = worldPos;
+        vec3 param_5 = nWorld;
+        uint param_6 = lightIndex;
+        vec2 param_7 = bary;
+        float _877 = targetFunction(param_4, param_5, param_6, param_7, param_8, param_9);
+        vec3 sampledPoint = param_8;
+        vec3 unshadowedColor = param_9;
+        float pHat = _877;
+        if (pHat <= 0.0)
+        {
+            continue;
+        }
+        float pdf = 1.0 / float(lightCount);
+        float w = pHat / pdf;
+        wSum += w;
+        if (r.y < (w / wSum))
+        {
+            selectedIndex = int(lightIndex);
+            selectedPoint = sampledPoint;
+            selectedUnshadowedColor = unshadowedColor;
+            selectedTargetPdf = pHat;
+        }
+    }
+    float finalM = float(candidates);
+    vec4 prevClip = p.previousViewProj * worldH;
+    int debugCategory = 0;
+    if (prevClip.w > 9.9999999747524270787835121154785e-07)
+    {
+        vec2 prevUV = ((prevClip.xy / vec2(prevClip.w)) * 0.5) + vec2(0.5);
+        float expectedPrevDepth = ((prevClip.z / prevClip.w) * 0.5) + 0.5;
+        bool _946 = prevUV.x >= 0.0;
+        bool _952;
+        if (_946)
+        {
+            _952 = prevUV.x <= 1.0;
+        }
+        else
+        {
+            _952 = _946;
+        }
+        bool _958;
+        if (_952)
+        {
+            _958 = prevUV.y >= 0.0;
+        }
+        else
+        {
+            _958 = _952;
+        }
+        bool _964;
+        if (_958)
+        {
+            _964 = prevUV.y <= 1.0;
+        }
+        else
+        {
+            _964 = _958;
+        }
+        if (_964)
+        {
+            debugCategory = 1;
+            ivec2 prevPix = ivec2(clamp(prevUV * vec2(float(p.frameData.y), float(p.frameData.z)), vec2(0.0), vec2(float(p.frameData.y - 1u), float(p.frameData.z - 1u))));
+            float historyStoredDepth = texelFetch(uHistoryDepth, prevPix, 0).x;
+            vec4 histA = texelFetch(uHistoryReservoirA, prevPix, 0);
+            float depthDelta = abs(historyStoredDepth - expectedPrevDepth);
+            float depthThreshold = max(0.00150000001303851604461669921875, abs(expectedPrevDepth) * p.depthRejectThreshold);
+            if (histA.x < 0.0)
+            {
+                debugCategory = 2;
+            }
+            if ((histA.x >= 0.0) && (depthDelta <= depthThreshold))
+            {
+                debugCategory = 3;
+                vec4 histB = texelFetch(uHistoryReservoirB, prevPix, 0);
+                uint histIndex = uint(histA.x);
+                float histWSum = histA.y;
+                float histM = min(histA.z, p.maxHistoryM);
+                float histCachedPHat = histA.w;
+                vec3 histPoint = histB.xyz;
+                vec3 param_10 = worldPos;
+                vec3 param_11 = nWorld;
+                uint param_12 = histIndex;
+                vec3 param_13 = histPoint;
+                vec3 param_14;
+                float _1067 = evaluateAtPoint(param_10, param_11, param_12, param_13, param_14);
+                vec3 histUnshadowedHere = param_14;
+                float histPHatHere = _1067;
+                if ((histPHatHere > 0.0) && (histCachedPHat > 0.0))
+                {
+                    debugCategory = 5;
+                    float histW = histPHatHere * (histWSum / histCachedPHat);
+                    wSum += histW;
+                    uvec2 param_15 = pix;
+                    uint param_16 = (p.frameData.x * 7919u) + 5u;
+                    float acceptR = rand2(param_15, param_16).x;
+                    if (acceptR < (histW / wSum))
+                    {
+                        selectedIndex = int(histIndex);
+                        selectedPoint = histPoint;
+                        selectedUnshadowedColor = histUnshadowedHere;
+                        selectedTargetPdf = histPHatHere;
+                    }
+                    finalM += histM;
+                }
+                else
+                {
+                    debugCategory = 4;
+                }
+            }
+        }
+    }
+    if (selectedIndex < 0)
+    {
+        int param_17 = debugCategory;
+        imageStore(uOutput, ipix, vec4(debugColor(param_17), 1.0));
+        imageStore(uReservoirA, ipix, vec4(-1.0, 0.0, 0.0, 0.0));
+        imageStore(uReservoirB, ipix, vec4(0.0));
+        return;
+    }
+    imageStore(uReservoirA, ipix, vec4(float(selectedIndex), wSum, finalM, selectedTargetPdf));
+    imageStore(uReservoirB, ipix, vec4(selectedPoint, 0.0));
+    vec3 mHeatmap = vec3(clamp(finalM / p.maxHistoryM, 0.0, 1.0));
+    vec3 param_18 = worldPos;
+    vec3 param_19 = nWorld;
+    vec3 param_20 = selectedPoint;
+    bool _1160 = traceVisibility(param_18, param_19, param_20);
+    bool visible = _1160;
+    if (!visible)
+    {
+        imageStore(uOutput, ipix, vec4(mHeatmap, 1.0));
+        return;
+    }
+    vec3 contribution = (selectedUnshadowedColor / vec3(selectedTargetPdf)) * (wSum / finalM);
+    imageStore(uOutput, ipix, vec4(mHeatmap, 1.0));
+}
+

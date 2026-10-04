@@ -1,0 +1,107 @@
+#version 460
+// water_fft.comp path-traced water, FFT ocean, every frame
+
+#define WAVE_N 256u
+#define WAVE_LOG2 8
+#define WAVE_CH 6u
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer SpectrumBuf { vec4 h0[]; };
+layout(std430, binding = 1) buffer TempBuf { vec2 temp[]; };
+layout(binding = 2, rgba16f) writeonly uniform image2DArray uOut;
+layout(std140, binding = 3) uniform FftParams {
+    vec4 a;
+    vec4 L;  // xyz = cascade sizes
+} P;
+layout(push_constant) uniform Push { uint pass; } pc;
+
+shared vec2 sh[WAVE_CH][WAVE_N];
+
+vec2 cmul(vec2 a, vec2 b) { return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x); }
+vec2 mulI(vec2 a) { return vec2(-a.y, a.x); }
+uint bitrev(uint i) { return bitfieldReverse(i) >> (32u - uint(WAVE_LOG2)); }
+
+void fftShared(uint t) {
+    for (int s = 0; s < WAVE_LOG2; ++s) {
+        barrier();
+        uint half_ = 1u << uint(s);
+        uint j = t & (half_ - 1u);
+        uint i0 = ((t >> uint(s)) << uint(s + 1)) + j;
+        uint i1 = i0 + half_;
+        float ang = 3.14159265 * float(j) / float(half_);  // + : inverse transform
+        vec2 w = vec2(cos(ang), sin(ang));
+        for (uint ch = 0u; ch < WAVE_CH; ++ch) {
+            vec2 a = sh[ch][i0];
+            vec2 b = cmul(sh[ch][i1], w);
+            sh[ch][i0] = a + b;
+            sh[ch][i1] = a - b;
+        }
+    }
+    barrier();
+}
+
+void main() {
+    uint t = gl_LocalInvocationID.x;
+    uint line = gl_WorkGroupID.x;  // row m (pass 0) / column x (pass 1)
+    uint c = gl_WorkGroupID.y;  // cascade
+    const uint N = WAVE_N;
+    if (pc.pass == 0u) {
+        uint m = line;
+        for (uint q = 0u; q < 2u; ++q) {
+            uint n = t + q * (N / 2u);
+            vec4 s = h0[(c * N + m) * N + n];
+            float dk = 6.2831853 / P.L[c];
+            vec2 k = dk * vec2(float(int(n) - int(N / 2u)), float(int(m) - int(N / 2u)));
+            float kl = length(k);
+            float w = sqrt(P.a.x * kl);
+            w = floor(w / P.a.z) * P.a.z;
+            float ph = w * P.a.y;
+            vec2 e = vec2(cos(ph), sin(ph));
+            vec2 H = cmul(s.xy, e) + cmul(s.zw, vec2(e.x, -e.y));
+            vec2 kn = kl > 1e-6 ? k / kl : vec2(0.0);
+            vec2 Dx = mulI(H) * -kn.x;  // -i kx/|k| H
+            vec2 Dy = mulI(H) * -kn.y;
+            vec2 dzdx = mulI(H) * k.x;  // i kx H
+            vec2 dzdy = mulI(H) * k.y;
+            vec2 dxdx = H * (k.x * kn.x);  // kx^2/|k| H
+            vec2 dydy = H * (k.y * kn.y);
+            // the slopes' rate of change and the height's curvature
+            vec2 Ht = mulI(cmul(s.xy, e) - cmul(s.zw, vec2(e.x, -e.y))) * w;
+            vec2 dzdxT = mulI(Ht) * k.x;  // d/dt (i kx H)
+            vec2 dzdyT = mulI(Ht) * k.y;
+            vec2 hxx = H * -(k.x * k.x);  // -kx^2 H
+            vec2 hyy = H * -(k.y * k.y);
+            vec2 hxy = H * -(k.x * k.y);
+            uint r = bitrev(n);
+            sh[0][r] = Dx + mulI(Dy);
+            sh[1][r] = H + mulI(dzdx);
+            sh[2][r] = dzdy + mulI(dxdx);
+            sh[3][r] = dydy + mulI(hxy);
+            sh[4][r] = dzdxT + mulI(dzdyT);
+            sh[5][r] = hxx + mulI(hyy);
+        }
+        fftShared(t);
+        for (uint q = 0u; q < 2u; ++q) {
+            uint n = t + q * (N / 2u);
+            for (uint ch = 0u; ch < WAVE_CH; ++ch) temp[((c * WAVE_CH + ch) * N + m) * N + n] = sh[ch][n];
+        }
+    } else {
+        uint x = line;
+        for (uint q = 0u; q < 2u; ++q) {
+            uint m = t + q * (N / 2u);
+            uint r = bitrev(m);
+            for (uint ch = 0u; ch < WAVE_CH; ++ch) sh[ch][r] = temp[((c * WAVE_CH + ch) * N + m) * N + x];
+        }
+        fftShared(t);
+        for (uint q = 0u; q < 2u; ++q) {
+            uint y = t + q * (N / 2u);
+            float sgn = ((x + y) & 1u) == 0u ? 1.0 : -1.0;  // centred spectrum
+            vec2 f0 = sh[0][y] * sgn, f1 = sh[1][y] * sgn, f2 = sh[2][y] * sgn, f3 = sh[3][y] * sgn;
+            vec2 f4 = sh[4][y] * sgn, f5 = sh[5][y] * sgn;
+            imageStore(uOut, ivec3(int(x), int(y), int(2u * c)), vec4(f0.x, f0.y, f1.x, f3.y));
+            imageStore(uOut, ivec3(int(x), int(y), int(2u * c + 1u)), vec4(f1.y, f2.x, f2.y, f3.x));
+            imageStore(uOut, ivec3(int(x), int(y), int(6u + c)), vec4(f4.x, f4.y, f5.x, f5.y));
+        }
+    }
+}

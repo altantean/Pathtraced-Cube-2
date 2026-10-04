@@ -1,0 +1,86 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// water_patch.comp path-traced water, displaced patch
+#include "rt_water_rects.glsl"
+
+layout(binding = 5) uniform sampler2DArray uWaveFft;
+layout(binding = 6) uniform sampler2D uWaveMap;
+#include "rt_water.glsl"
+#include "rt_lava.glsl"  // lava cells
+
+layout(local_size_x = 64) in;
+
+// must match RayTracingScene::ChunkRtVertex / skin.comp's ChunkRtVertexGpu
+struct ChunkRtVertexGpu {
+    float px, py, pz;
+    float nx, ny, nz;
+    float tx, ty, tz, tw;
+    float u, v;
+    uint textureIndex;
+    uint materialIndex;
+    uint blendMaterialIndex;
+    float blendAlpha;
+    float blendU, blendV;
+    float alphaTestCutoff;
+    float blendLmU, blendLmV;
+    uint blendLmTexIndex;
+};
+
+layout(std430, binding = 3) writeonly buffer OutBuf { ChunkRtVertexGpu outVerts[]; };
+layout(std140, binding = 4) uniform PatchParams {
+    vec4 origin;  // xy = patch origin (world), z = cell size, w = cells per side
+    vec4 buckets;  // xy = bucket grid origin, z = bucket size, w = buckets along x
+    vec4 buckets2;
+    vec4 fft;  // rt_water.glsl
+    vec4 map;  // rt_water.glsl
+    vec4 amp;  // rt_water.glsl
+    vec4 lava0;  // rt_lava.glsl, pathtrace_trace.comp's p.lava0 / p.lava1
+    vec4 lava1;
+} P;
+
+ChunkRtVertexGpu makeVertex(vec3 pos, uint mat) {
+    ChunkRtVertexGpu o;
+    o.px = pos.x; o.py = pos.y; o.pz = pos.z;
+    o.nx = 0.0; o.ny = 0.0; o.nz = 1.0;  // the shading normal is the wave field's own (waterWaveNormal)
+    o.tx = 1.0; o.ty = 0.0; o.tz = 0.0; o.tw = 1.0;
+    o.u = 0.0; o.v = 0.0;
+    o.textureIndex = 0u;
+    o.materialIndex = mat;
+    o.blendMaterialIndex = 0xFFFFFFFFu;
+    o.blendAlpha = 0.0;
+    o.blendU = 0.0; o.blendV = 0.0;
+    o.alphaTestCutoff = 0.0;
+    o.blendLmU = 0.0; o.blendLmV = 0.0;
+    o.blendLmTexIndex = 0u;
+    return o;
+}
+
+void main() {
+    uint n = uint(P.origin.w);
+    uint cell = gl_GlobalInvocationID.x;
+    if (cell >= n * n) return;
+    float s = P.origin.z;
+    vec2 ci = vec2(float(cell % n), float(cell / n));
+    vec2 c0 = P.origin.xy + ci * s;
+    float z, kind, glow; uint mat;
+    uint base = cell * 4u;
+    if (!waterAt(c0 + vec2(0.5 * s), P.buckets, P.buckets2.x, z, mat, kind, glow)) {
+        ChunkRtVertexGpu o = makeVertex(vec3(c0, P.buckets2.w), 0u);
+        for (uint k = 0u; k < 4u; ++k) outVerts[base + k] = o;
+        return;
+    }
+    const vec2 corner[4] = vec2[4](vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(1.0, 1.0), vec2(0.0, 1.0));
+    float size = float(n) * s;
+    for (uint k = 0u; k < 4u; ++k) {
+        vec2 xy = P.origin.xy + (ci + corner[k]) * s;
+        vec2 e2 = min(xy - P.origin.xy, P.origin.xy + vec2(size) - xy);
+        float fade = smoothstep(0.0, max(P.buckets2.y, 1e-3), min(e2.x, e2.y));
+        if (kind > 0.5) {  // crust plates raised, cracks sunken, the shading field's own height
+            float hl = lavaSurfaceS(vec3(xy, z), vec3(0.0, 0.0, 1.0), glow, P.lava0, P.lava1, lavaShoreFromMap(uWaveMap, P.map, xy)).height;  // same shore the shading sees
+            outVerts[base + k] = makeVertex(vec3(xy, z + hl * fade), mat);
+            continue;
+        }
+        vec3 d = waterWaveDisplacement(xy, P.fft, P.map, P.amp) * (P.buckets2.z * fade);
+        outVerts[base + k] = makeVertex(vec3(xy + d.xy, z + d.z), mat);
+    }
+}

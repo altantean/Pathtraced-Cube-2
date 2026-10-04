@@ -1,0 +1,54 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+// water_spectrum.comp path-traced water, FFT ocean
+#include "rt_water_spectrum.glsl"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) writeonly buffer SpectrumBuf { vec4 h0[]; };
+layout(std140, binding = 1) uniform SpectrumParams {
+    vec4 a;  // x = N, y = g, z = wind speed, w = fetch
+    vec4 b;
+    vec4 L;  // xyz = cascade sizes, w = seed
+    vec4 kb;
+} P;
+
+uint pcg(uint v) {
+    uint state = v * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+vec2 gauss2(uint seed) {
+    float u1 = max(float(pcg(seed)) / 4294967296.0, 1e-7);
+    float u2 = float(pcg(seed ^ 0x9E3779B9u)) / 4294967296.0;
+    float r = sqrt(-2.0 * log(u1));
+    return r * vec2(cos(6.2831853 * u2), sin(6.2831853 * u2));
+}
+
+vec2 h0At(uint c, int n, int m) {
+    int N = int(P.a.x);
+    float dk = 6.2831853 / P.L[c];
+    vec2 k = dk * vec2(float(n - N / 2), float(m - N / 2));
+    float kl = length(k);
+    float lo = c == 0u ? 0.0 : P.kb[c - 1u];
+    float hi = c == 2u ? P.kb.z : P.kb[c];
+    if (kl <= 1e-6 || kl < lo || kl >= hi) return vec2(0.0);
+    float g = P.a.y;
+    float S = jonswapK(kl, g, P.a.z, P.a.w);
+    float cosHalf = abs(cos(0.5 * acos(clamp(dot(k / kl, P.b.xy), -1.0, 1.0))));
+    float D = P.b.z * pow(cosHalf, 2.0 * P.b.w);
+    float S2 = S * D / kl;  // per unit area of k-space
+    float amp = sqrt(max(S2 * dk * dk * 0.5, 0.0));
+    uint seed = pcg(uint(P.L.w) ^ pcg(c * 0x01000193u ^ pcg(uint(n) * 7919u ^ uint(m) * 104729u)));
+    return gauss2(seed) * (amp * 0.70710678);
+}
+
+void main() {
+    uint N = uint(P.a.x);
+    uvec3 id = gl_GlobalInvocationID;
+    if (id.x >= N || id.y >= N || id.z >= 3u) return;
+    int n = int(id.x), m = int(id.y);
+    vec2 hk = h0At(id.z, n, m);
+    vec2 hmk = h0At(id.z, (int(N) - n) % int(N), (int(N) - m) % int(N));
+    h0[(id.z * N + id.y) * N + id.x] = vec4(hk, hmk.x, -hmk.y);
+}
